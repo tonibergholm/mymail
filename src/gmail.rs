@@ -66,10 +66,10 @@ pub fn load_client() -> Result<OAuthClient> {
 
 pub fn load_accounts() -> Vec<SavedAccount> {
     let path = dir().join("accounts.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = std::fs::read(&path) else {
         return vec![];
     };
-    serde_json::from_str(&text).unwrap_or_else(|_| {
+    serde_json::from_slice(&text).unwrap_or_else(|_| {
         // Keep the unreadable file instead of overwriting its tokens on the next save.
         let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
         vec![]
@@ -505,6 +505,21 @@ fn inline_text_bodies(
     Ok(())
 }
 
+/// Decode with the part's declared charset (e.g. ISO-8859-1); UTF-8 when absent or unknown.
+fn decode_charset(content_type: &str, bytes: &[u8]) -> String {
+    let label = content_type
+        .split(';')
+        .find_map(|p| {
+            p.trim()
+                .strip_prefix("charset=")
+                .or_else(|| p.trim().strip_prefix("CHARSET="))
+        })
+        .map(|c| c.trim_matches('"'))
+        .unwrap_or("utf-8");
+    let enc = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    enc.decode(bytes).0.into_owned()
+}
+
 fn find_bodies(part: &Value, plain: &mut Option<String>, html: &mut Option<String>) {
     let mime = part["mimeType"].as_str().unwrap_or("");
     if part["filename"].as_str().is_some_and(|f| !f.is_empty()) {
@@ -515,7 +530,7 @@ fn find_bodies(part: &Value, plain: &mut Option<String>, html: &mut Option<Strin
             .decode(data)
             .or_else(|_| URL_SAFE_NO_PAD.decode(data));
         if let Ok(bytes) = decoded {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = decode_charset(&header(part, "Content-Type"), &bytes);
             match mime {
                 "text/plain" if plain.is_none() => *plain = Some(text),
                 "text/html" if html.is_none() => *html = Some(text),
@@ -715,6 +730,14 @@ mod tests {
             Some("OAuth state mismatch")
         );
         assert!(t.join().unwrap().contains("Sign-in failed"));
+    }
+
+    #[test]
+    fn decodes_declared_charset() {
+        let m = json!({"payload":{"mimeType":"text/plain",
+            "headers":[{"name":"Content-Type","value":"text/plain; charset=\"ISO-8859-1\""}],
+            "body":{"data":URL_SAFE.encode(b"Hyv\xe4\xe4 p\xe4iv\xe4\xe4")}}});
+        assert_eq!(parse_message(&m).body, "Hyvää päivää");
     }
 
     #[test]

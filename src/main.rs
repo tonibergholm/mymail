@@ -138,7 +138,7 @@ impl MailApp {
         } else {
             q
         };
-        let (account, query) = (self.current, q.clone());
+        let (account, query) = (client.clone(), q.clone());
         self.run(
             "Loading…",
             window,
@@ -148,13 +148,19 @@ impl MailApp {
                 let Ok(list) = list else { return };
                 // Drop stale results if the user switched account or query meanwhile.
                 let now = this.search.read(cx).value().trim().to_string();
-                if this.current != account
+                if !this.client().is_some_and(|c| Arc::ptr_eq(&c, &account))
                     || (now != query && !(now.is_empty() && query == "in:inbox"))
                 {
                     return;
                 }
                 this.list = list;
                 this.list_gen += 1;
+                if let Some(c) = &this.compose {
+                    // Don't throw away a draft; just re-point the selection at its message.
+                    let id = &c.msg.id;
+                    this.selected = this.list.iter().position(|x| &x.id == id);
+                    return;
+                }
                 this.selected = None;
                 this.open = None;
                 this.compose = None;
@@ -246,6 +252,14 @@ impl MailApp {
     fn start_compose(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(msg) = self.open.clone() else { return };
         let to_value = match kind {
+            // Follow-up on my own sent mail goes to the original recipients.
+            Kind::Reply
+                if self
+                    .client()
+                    .is_some_and(|c| msg.from.to_lowercase().contains(&c.email.to_lowercase())) =>
+            {
+                msg.to.clone()
+            }
             Kind::Reply if !msg.reply_to.is_empty() => msg.reply_to.clone(),
             Kind::Reply => msg.from.clone(),
             Kind::Forward => String::new(),

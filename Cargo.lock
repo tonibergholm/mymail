@@ -3817,6 +3817,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "dirs 7.0.0",
+ "encoding_rs",
  "getrandom 0.3.4",
  "gpui-kit",
  "html2text",
