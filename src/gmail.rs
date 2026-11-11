@@ -505,7 +505,7 @@ fn safe_name(name: &str) -> String {
     if base.is_empty() {
         "attachment".into()
     } else {
-        base.into()
+        short_name(base) // file systems cap names at 255 bytes
     }
 }
 
@@ -748,15 +748,17 @@ impl Client {
     pub fn attachment(&self, msg_id: &str, part: &str) -> Result<Vec<u8>> {
         let m = self.get(&format!("/messages/{msg_id}?format=full"))?;
         let p = find_part(&m["payload"], part).ok_or("attachment not found")?;
-        let data = match p["body"]["data"].as_str().filter(|d| !d.is_empty()) {
-            Some(d) => d.to_string(),
-            None => {
-                let att = p["body"]["attachmentId"]
-                    .as_str()
-                    .ok_or("no attachment data")?;
+        // Inline data may be empty for a zero-byte file; only fetch when there's an id.
+        let data = match (
+            p["body"]["attachmentId"].as_str(),
+            p["body"]["data"].as_str(),
+        ) {
+            (Some(att), _) => {
                 let v = self.get(&format!("/messages/{msg_id}/attachments/{att}"))?;
                 v["data"].as_str().unwrap_or("").to_string()
             }
+            (None, Some(d)) => d.to_string(),
+            (None, None) => return Err("no attachment data".into()),
         };
         URL_SAFE
             .decode(&data)
@@ -1584,6 +1586,7 @@ mod tests {
         assert_eq!(safe_name("a\nb.txt"), "ab.txt");
         assert_eq!(safe_name(".."), "attachment");
         assert_eq!(safe_name("inv\u{202E}fdp.sh"), "invfdp.sh");
+        assert!(safe_name(&format!("{}.pdf", "ä".repeat(300))).len() <= 150);
         let long = short_name(&format!("{}.pdf", "漢".repeat(200)));
         assert!(long.len() <= 150 && long.ends_with(".pdf"));
         assert_eq!(
