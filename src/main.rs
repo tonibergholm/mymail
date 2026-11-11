@@ -5,8 +5,11 @@ mod web;
 use gmail::{Client, Message, OAuthClient, SavedAccount, Summary};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::text::{TextView, TextViewState};
-use gpui_kit::component::{ActiveTheme, Sizable, Theme, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Sizable, Theme, h_flex, h_resizable, resizable_panel, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::sync::Arc;
@@ -228,15 +231,21 @@ impl MailApp {
                 }
                 match &m.html {
                     #[cfg(target_os = "macos")]
-                    Some(h) if this.web.is_some() => this.web.as_ref().unwrap().load(h),
+                    Some(h) if this.web.is_some() => {
+                        this.web.as_ref().unwrap().load(h, &details_html(&m))
+                    }
                     // Fresh state per message so it opens scrolled to the top.
                     Some(h) => {
-                        this.html_view = cx
-                            .new(|cx| TextViewState::html(h, cx).scrollable(true).selectable(true))
+                        let h = format!("{}{h}", details_html(&m));
+                        this.html_view = cx.new(|cx| {
+                            TextViewState::html(&h, cx)
+                                .scrollable(true)
+                                .selectable(true)
+                        })
                     }
-                    None => this
-                        .reader
-                        .update(cx, |r, cx| r.set_value(m.body.clone(), window, cx)),
+                    None => this.reader.update(cx, |r, cx| {
+                        r.set_value(format!("{}{}", details_text(&m), m.body), window, cx)
+                    }),
                 }
                 this.open = Some(Arc::new(m));
             },
@@ -440,6 +449,7 @@ impl MailApp {
         let selected = self.selected == Some(ix);
         v_flex()
             .id(ix)
+            .w_full()
             .h(px(76.))
             .px_3()
             .py_1()
@@ -487,7 +497,10 @@ impl MailApp {
     fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
         #[cfg(target_os = "macos")]
         if let Some(web) = &self.web {
-            web.set_visible(self.open.as_ref().is_some_and(|m| m.html.is_some()));
+            // Step aside while the split is dragged, or the native view swallows the drag.
+            web.set_visible(
+                !cx.has_active_drag() && self.open.as_ref().is_some_and(|m| m.html.is_some()),
+            );
         }
         let t = cx.theme();
         let Some(m) = self.open.clone() else {
@@ -500,49 +513,36 @@ impl MailApp {
                 .child("j/k move · e archive · r reply · f forward · / search")
                 .into_any_element();
         };
-        let muted = t.muted_foreground;
-        let line = |label: &str, value: &str| {
-            h_flex()
-                .gap_2()
-                .child(div().w(px(48.)).text_color(muted).child(label.to_string()))
-                .child(value.to_string())
-        };
-        let mut col = v_flex().flex_1().min_h_0().child(
-            v_flex()
-                .p_3()
-                .gap_1()
-                .border_b_1()
-                .border_color(t.border)
-                .child(
-                    div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(m.subject.clone()),
-                )
-                .child(line("From", &gmail::decode_words(&m.from)))
-                .child(line("To", &gmail::decode_words(&m.to)))
-                .when(!m.cc.is_empty(), |d| {
-                    d.child(line("Cc", &gmail::decode_words(&m.cc)))
-                })
-                .child(line("Date", &m.date))
-                .child(
-                    h_flex()
-                        .pt_1()
-                        .gap_2()
-                        .child(Button::new("reply").small().label("Reply (r)").on_click(
-                            cx.listener(|this, _, w, cx| this.start_compose(Kind::Reply, w, cx)),
-                        ))
-                        .child(Button::new("fwd").small().label("Forward (f)").on_click(
-                            cx.listener(|this, _, w, cx| this.start_compose(Kind::Forward, w, cx)),
-                        ))
-                        .child(
-                            Button::new("archive")
-                                .small()
-                                .label("Archive (e)")
-                                .on_click(cx.listener(|this, _, w, cx| this.archive(w, cx))),
-                        ),
-                ),
-        );
+        // Minimal fixed bar; From/To/Date live at the top of the scrolling content.
+        let act =
+            |id: &'static str, label: &'static str| Button::new(id).ghost().xsmall().label(label);
+        let mut col =
+            v_flex().flex_1().min_h_0().child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(m.subject.clone()),
+                    )
+                    .child(act("reply", "Reply").on_click(
+                        cx.listener(|this, _, w, cx| this.start_compose(Kind::Reply, w, cx)),
+                    ))
+                    .child(act("fwd", "Forward").on_click(
+                        cx.listener(|this, _, w, cx| this.start_compose(Kind::Forward, w, cx)),
+                    ))
+                    .child(
+                        act("archive", "Archive")
+                            .on_click(cx.listener(|this, _, w, cx| this.archive(w, cx))),
+                    ),
+            );
         if let Some(c) = &self.compose {
             let title = if c.kind == Kind::Reply {
                 "Reply"
@@ -614,6 +614,48 @@ impl MailApp {
     }
 }
 
+/// Header lines shown at the top of the message, scrolling away with it.
+fn details(m: &Message) -> Vec<(&'static str, String)> {
+    let mut v = vec![
+        ("From", gmail::decode_words(&m.from)),
+        ("To", gmail::decode_words(&m.to)),
+    ];
+    if !m.cc.is_empty() {
+        v.push(("Cc", gmail::decode_words(&m.cc)));
+    }
+    v.push(("Date", m.date.clone()));
+    v
+}
+
+fn details_text(m: &Message) -> String {
+    details(m)
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\n"))
+        .collect::<String>()
+        + "\n"
+}
+
+fn details_html(m: &Message) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let rows: String = details(m)
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "<div><span style=\"color:#888\">{k}</span>&nbsp; {}</div>",
+                esc(v)
+            )
+        })
+        .collect();
+    format!(
+        "<div style=\"font:12px/1.6 -apple-system,system-ui,sans-serif;color:#333;background:#fff;\
+         padding:8px 14px;border-bottom:1px solid #e5e5e5;text-align:left\">{rows}</div>"
+    )
+}
+
 /// "Tue, 4 Nov 2026 10:22:01 +0200" -> "4 Nov"
 fn short_date(d: &str) -> String {
     let d = d.split_once(", ").map_or(d, |x| x.1);
@@ -623,20 +665,45 @@ fn short_date(d: &str) -> String {
 impl Render for MailApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
-        let mut accounts = h_flex().gap_1();
-        for (i, c) in self.clients.iter().enumerate() {
-            let b = Button::new(("acct", i)).small().label(c.email.clone());
-            let b = if i == self.current {
-                b.primary()
-            } else {
-                b.ghost()
-            };
-            accounts = accounts.child(b.on_click(cx.listener(move |this, _, w, cx| {
-                if this.current != i {
-                    this.switch_account(i, w, cx);
+        let this = cx.entity().downgrade();
+        let emails: Vec<String> = self.clients.iter().map(|c| c.email.clone()).collect();
+        let (current, can_add) = (self.current, self.oauth.is_some());
+        let label = emails
+            .get(current)
+            .cloned()
+            .unwrap_or_else(|| "Accounts".into());
+        let accounts = Button::new("accounts")
+            .ghost()
+            .small()
+            .label(format!("{label} ▾"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for (i, email) in emails.iter().enumerate() {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(email.clone())
+                            .checked(i == current)
+                            .on_click(move |_, window, cx| {
+                                this.update(cx, |app, cx| {
+                                    if app.current != i {
+                                        app.switch_account(i, window, cx)
+                                    }
+                                })
+                                .ok();
+                            }),
+                    );
                 }
-            })));
-        }
+                if can_add {
+                    let this = this.clone();
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Add account…").on_click(move |_, window, cx| {
+                                this.update(cx, |app, cx| app.add_account(window, cx)).ok();
+                            }),
+                        );
+                }
+                menu
+            });
         let count = self.list.len();
         v_flex()
             .size_full()
@@ -650,15 +717,6 @@ impl Render for MailApp {
                     .border_b_1()
                     .border_color(t.border)
                     .child(accounts)
-                    .when(self.oauth.is_some(), |d| {
-                        d.child(
-                            Button::new("add")
-                                .ghost()
-                                .small()
-                                .label("+ Account")
-                                .on_click(cx.listener(|this, _, w, cx| this.add_account(w, cx))),
-                        )
-                    })
                     .child(
                         div()
                             .flex_1()
@@ -666,40 +724,45 @@ impl Render for MailApp {
                     ),
             )
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_start()
-                    .child(
-                        div()
-                            .w(px(380.))
-                            .flex_none()
-                            .h_full()
-                            .border_r_1()
-                            .border_color(t.border)
-                            .track_focus(&self.focus)
-                            .on_key_down(cx.listener(Self::on_key))
-                            .child(
-                                uniform_list(
-                                    "messages",
-                                    count,
-                                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                        range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
-                                    }),
-                                )
-                                .track_scroll(&self.scroll)
-                                .size_full(),
+                div().flex_1().min_h_0().child(
+                    h_resizable("split")
+                        .child(
+                            resizable_panel()
+                                .size(px(380.))
+                                .size_range(px(240.)..px(900.))
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .track_focus(&self.focus)
+                                        .on_key_down(cx.listener(Self::on_key))
+                                        .child(
+                                            uniform_list(
+                                                "messages",
+                                                count,
+                                                cx.processor(
+                                                    |this, range: std::ops::Range<usize>, _, cx| {
+                                                        range
+                                                            .map(|ix| this.render_row(ix, cx))
+                                                            .collect::<Vec<_>>()
+                                                    },
+                                                ),
+                                            )
+                                            .track_scroll(&self.scroll)
+                                            .size_full(),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            resizable_panel().child(
+                                div()
+                                    .size_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(self.render_detail(cx)),
                             ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0() // wide HTML must not squeeze the list
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(self.render_detail(cx)),
-                    ),
+                        ),
+                ),
             )
             .when(!self.status.is_empty(), |d| {
                 d.child(

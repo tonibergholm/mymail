@@ -6,6 +6,8 @@ use std::cell::Cell;
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, Rect, WebView, WebViewBuilder};
 
+const INSET: f64 = 6.0;
+
 pub struct Web {
     view: WebView,
     bounds: Cell<Option<Bounds<Pixels>>>,
@@ -45,8 +47,9 @@ impl Web {
         })
     }
 
-    pub fn load(&self, html: &str) {
-        let _ = self.view.load_html(&harden(html));
+    /// `header` (trusted, ours) goes right after the CSP, above the mail.
+    pub fn load(&self, html: &str, header: &str) {
+        let _ = self.view.load_html(&harden(html, header));
         // Keep j/k/e/r/f going to the app, not the web view.
         let _ = self.view.focus_parent();
     }
@@ -61,8 +64,14 @@ impl Web {
     pub fn place(&self, b: Bounds<Pixels>) {
         if self.bounds.replace(Some(b)) != Some(b) {
             let _ = self.view.set_bounds(Rect {
-                position: LogicalPosition::new(f64::from(b.origin.x), f64::from(b.origin.y)).into(),
-                size: LogicalSize::new(f64::from(b.size.width), f64::from(b.size.height)).into(),
+                // Leave the split handle's grab area (left edge) to GPUI.
+                position: LogicalPosition::new(
+                    f64::from(b.origin.x) + INSET,
+                    f64::from(b.origin.y),
+                )
+                .into(),
+                size: LogicalSize::new(f64::from(b.size.width) - INSET, f64::from(b.size.height))
+                    .into(),
             });
         }
     }
@@ -70,7 +79,7 @@ impl Web {
 
 /// Without JavaScript, mail can only navigate on its own through meta refresh or frames.
 /// Block both (and forms) so only real link clicks reach `open_external`.
-fn harden(html: &str) -> String {
+fn harden(html: &str, header: &str) -> String {
     const CSP: &str = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
         img-src * data:; style-src * 'unsafe-inline'; font-src * data:; \
         frame-src 'none'; form-action 'none'; script-src 'none'\">";
@@ -91,7 +100,7 @@ fn harden(html: &str) -> String {
     } else {
         0
     };
-    body.insert_str(at, CSP);
+    body.insert_str(at, &format!("{CSP}{header}"));
     body
 }
 
@@ -99,8 +108,10 @@ fn harden(html: &str) -> String {
 mod tests {
     #[test]
     fn harden_blocks_auto_navigation() {
-        let h =
-            super::harden(r#"<META HTTP-EQUIV="refresh" content="0;url=https://evil"><p>hi</p>"#);
+        let h = super::harden(
+            r#"<META HTTP-EQUIV="refresh" content="0;url=https://evil"><p>hi</p>"#,
+            "",
+        );
         assert!(h.starts_with("<meta http-equiv=\"Content-Security-Policy\""));
         assert!(h.contains("frame-src 'none'"));
         assert!(
@@ -113,7 +124,10 @@ mod tests {
 
     #[test]
     fn harden_keeps_doctype_first() {
-        let h = super::harden("\n<!DOCTYPE html><html><body>x</body></html>");
+        let h = super::harden(
+            "\n<!DOCTYPE html><html><body>x</body></html>",
+            "<div>hdr</div>",
+        );
         assert!(h.starts_with("\n<!DOCTYPE html><meta http-equiv=\"Content-Security-Policy\""));
     }
 }

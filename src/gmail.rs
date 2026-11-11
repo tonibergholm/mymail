@@ -513,7 +513,10 @@ fn summary(m: &Value) -> Summary {
         from: display_name(&decode_words(&header(p, "From"))),
         subject: decode_words(&header(p, "Subject")),
         date: header(p, "Date"),
-        snippet: unescape_html(m["snippet"].as_str().unwrap_or("")),
+        snippet: strip_padding(&unescape_html(m["snippet"].as_str().unwrap_or("")))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
         unread: m["labelIds"]
             .as_array()
             .is_some_and(|l| l.iter().any(|x| x == "UNREAD")),
