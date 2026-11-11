@@ -409,11 +409,13 @@ impl Client {
                 ("refresh_token", &self.refresh_token),
                 ("grant_type", "refresh_token"),
             ])
-            .map_err(|e| {
-                format!(
-                    "token refresh failed for {} ({e}); re-add the account",
+            .map_err(|e| match e {
+                // Google answers 400/401 for a revoked or expired refresh token.
+                ureq::Error::StatusCode(400 | 401) => format!(
+                    "Sign-in for {} expired ({e}); re-add the account",
                     self.email
-                )
+                ),
+                e => format!("Couldn't reach Google for {} ({e})", self.email),
             })?
             .body_mut()
             .read_json()

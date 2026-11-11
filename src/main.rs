@@ -624,9 +624,13 @@ impl MailApp {
                     .gap_2()
                     .items_center()
                     // Unread: blue dot and bold; read: dimmed, so the two differ in dark mode too.
-                    .when(s.unread, |d| {
-                        d.child(div().size(px(7.)).flex_none().rounded_full().bg(t.blue))
-                    })
+                    .child(
+                        div()
+                            .size(px(7.))
+                            .flex_none()
+                            .rounded_full()
+                            .when(s.unread, |d| d.bg(t.blue)),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -872,7 +876,7 @@ fn local(ms: i64) -> Option<chrono::DateTime<chrono::Local>> {
 /// Local time: "14:05" today, "4 Nov" this year, "4 Nov 2025" before.
 fn list_time(ms: i64, header: &str) -> String {
     let Some(t) = local(ms) else {
-        // No internalDate (old cache): "Tue, 4 Nov 2026 10:22:01 +0200" -> "4 Nov"
+        // No internalDate from Gmail: "Tue, 4 Nov 2026 10:22:01 +0200" -> "4 Nov"
         let d = header.split_once(", ").map_or(header, |x| x.1);
         return d.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
     };
