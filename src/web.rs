@@ -76,16 +76,23 @@ fn harden(html: &str) -> String {
         frame-src 'none'; form-action 'none'; script-src 'none'\">";
     // Disable the mail's own http-equiv metas (refresh, a looser CSP); ours comes first.
     let lower = html.to_ascii_lowercase();
-    let mut out = String::with_capacity(html.len() + CSP.len());
-    out += CSP;
+    let mut body = String::with_capacity(html.len());
     let mut last = 0;
     for (i, _) in lower.match_indices("http-equiv") {
-        out += &html[last..i];
-        out += "data-x-equiv";
+        body += &html[last..i];
+        body += "data-x-equiv";
         last = i + "http-equiv".len();
     }
-    out += &html[last..];
-    out
+    body += &html[last..];
+    // Insert after a leading doctype: anything before it would force quirks mode.
+    let start = body.len() - body.trim_start().len();
+    let at = if body[start..].to_ascii_lowercase().starts_with("<!doctype") {
+        body[start..].find('>').map_or(0, |e| start + e + 1)
+    } else {
+        0
+    };
+    body.insert_str(at, CSP);
+    body
 }
 
 #[cfg(test)]
@@ -102,5 +109,11 @@ mod tests {
                 .contains("http-equiv")
         );
         assert!(h.ends_with("<p>hi</p>"));
+    }
+
+    #[test]
+    fn harden_keeps_doctype_first() {
+        let h = super::harden("\n<!DOCTYPE html><html><body>x</body></html>");
+        assert!(h.starts_with("\n<!DOCTYPE html><meta http-equiv=\"Content-Security-Policy\""));
     }
 }
