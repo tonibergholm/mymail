@@ -1153,13 +1153,33 @@ fn b64_lines(data: &[u8]) -> String {
 
 /// `filename="a.pdf"`, or RFC 2231 `filename*=UTF-8''...` for anything non-ASCII.
 fn file_param(key: &str, name: &str) -> String {
-    // Keep the header line well under the 998-character limit.
-    let name: String = clean(name).chars().take(120).collect();
+    let name = short_name(&clean(name));
     if name.bytes().all(|b| (b' '..=b'~').contains(&b)) && !name.contains(['"', '\\']) {
         format!("{key}=\"{name}\"")
     } else {
         format!("{key}*=UTF-8''{}", enc(&name))
     }
+}
+
+/// At most 150 bytes (≤450 once %-encoded, well under the 998-char line limit),
+/// cutting the stem so the extension survives.
+fn short_name(name: &str) -> String {
+    const MAX: usize = 150;
+    if name.len() <= MAX {
+        return name.to_string();
+    }
+    let ext = match name.rsplit_once('.') {
+        Some((_, e)) if e.len() <= 10 => &name[name.len() - e.len() - 1..],
+        _ => "",
+    };
+    let mut stem = String::new();
+    for c in name[..name.len() - ext.len()].chars() {
+        if stem.len() + c.len_utf8() + ext.len() > MAX {
+            break;
+        }
+        stem.push(c);
+    }
+    stem + ext
 }
 
 fn build(
@@ -1564,7 +1584,12 @@ mod tests {
         assert_eq!(safe_name("a\nb.txt"), "ab.txt");
         assert_eq!(safe_name(".."), "attachment");
         assert_eq!(safe_name("inv\u{202E}fdp.sh"), "invfdp.sh");
-        assert_eq!(file_param("filename", "a\tb.pdf"), "filename*=UTF-8''a%09b.pdf");
+        let long = short_name(&format!("{}.pdf", "漢".repeat(200)));
+        assert!(long.len() <= 150 && long.ends_with(".pdf"));
+        assert_eq!(
+            file_param("filename", "a\tb.pdf"),
+            "filename*=UTF-8''a%09b.pdf"
+        );
         let dir = std::path::Path::new("/d");
         let taken = |p: &std::path::Path| p.ends_with("r.pdf") || p.ends_with("r (1).pdf");
         assert_eq!(unique_path(dir, "r.pdf", taken), dir.join("r (2).pdf"));
