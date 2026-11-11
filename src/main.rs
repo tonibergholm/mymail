@@ -36,6 +36,8 @@ struct MailApp {
     status: SharedString,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    /// Bumped whenever `list` is replaced, so late callbacks can tell it changed.
+    list_gen: u64,
     _subs: Vec<Subscription>,
 }
 
@@ -85,6 +87,7 @@ impl MailApp {
             status,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            list_gen: 0,
             _subs: subs,
         };
         if app.clients.is_empty() && app.oauth.is_some() {
@@ -151,6 +154,7 @@ impl MailApp {
                     return;
                 }
                 this.list = list;
+                this.list_gen += 1;
                 this.selected = None;
                 this.open = None;
                 this.compose = None;
@@ -212,7 +216,7 @@ impl MailApp {
         let (Some(ix), Some(client)) = (self.selected, self.client()) else {
             return;
         };
-        let (summary, account) = (self.list.remove(ix), self.current);
+        let (summary, list_gen) = (self.list.remove(ix), self.list_gen);
         let id = summary.id.clone();
         self.open = None;
         self.compose = None;
@@ -228,7 +232,7 @@ impl MailApp {
             move |this, r, _, _| {
                 // Optimistic removal: put the row back if Gmail refused.
                 if r.is_err()
-                    && this.current == account
+                    && this.list_gen == list_gen
                     && !this.list.iter().any(|x| x.id == summary.id)
                 {
                     let at = ix.min(this.list.len());
@@ -353,6 +357,7 @@ impl MailApp {
     fn switch_account(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.current = i;
         self.list.clear();
+        self.list_gen += 1;
         self.selected = None;
         self.open = None;
         self.compose = None;

@@ -475,7 +475,7 @@ fn inline_text_bodies(
     let no_name = part["filename"].as_str().is_none_or(str::is_empty);
     if is_text
         && no_name
-        && part["body"]["data"].is_null()
+        && part["body"]["data"].as_str().is_none_or(str::is_empty)
         && let Some(att) = part["body"]["attachmentId"].as_str()
     {
         part["body"]["data"] = fetch(att)?;
@@ -659,6 +659,7 @@ mod tests {
     fn fetches_text_bodies_stored_as_attachments() {
         let mut m = json!({"id":"1","payload":{"mimeType":"multipart/mixed","parts":[
             {"mimeType":"text/plain","filename":"","body":{"attachmentId":"A1","size":90000}},
+            {"mimeType":"text/html","body":{"attachmentId":"A3","data":""}},
             {"mimeType":"application/pdf","filename":"x.pdf","body":{"attachmentId":"A2"}}]}});
         let mut asked = vec![];
         inline_text_bodies(&mut m["payload"], &mut |att| {
@@ -666,7 +667,7 @@ mod tests {
             Ok(json!(URL_SAFE.encode("big body")))
         })
         .unwrap();
-        assert_eq!(asked, ["A1"]);
+        assert_eq!(asked, ["A1", "A3"]);
         assert_eq!(parse_message(&m).body, "big body");
     }
 
