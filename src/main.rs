@@ -502,15 +502,24 @@ impl MailApp {
             move || login.finish(&o),
             move |this, acct, window, cx| {
                 let Ok(acct) = acct else { return };
-                this.saved.retain(|a| a.email != acct.email);
-                this.clients.retain(|c| c.email != acct.email);
-                this.saved.push(acct.clone());
-                this.clients.push(Arc::new(Client::new(oauth, acct)));
+                // Replace in place: indexes (and `current`) must stay valid if the switch is refused.
+                let client = Arc::new(Client::new(oauth, acct.clone()));
+                let i = match this.saved.iter().position(|a| a.email == acct.email) {
+                    Some(i) => {
+                        this.saved[i] = acct;
+                        this.clients[i] = client;
+                        i
+                    }
+                    None => {
+                        this.saved.push(acct);
+                        this.clients.push(client);
+                        this.clients.len() - 1
+                    }
+                };
                 if let Err(e) = gmail::save_accounts(&this.saved) {
                     this.status = format!("Signed in, but saving failed: {e}").into();
                 }
-                let last = this.clients.len() - 1;
-                this.switch_account(last, window, cx);
+                this.switch_account(i, window, cx);
             },
         );
     }
