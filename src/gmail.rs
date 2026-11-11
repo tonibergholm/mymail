@@ -447,6 +447,13 @@ fn summary(m: &Value) -> Summary {
     }
 }
 
+/// `"Jane Doe" <jane@x.com>` -> `jane@x.com`
+pub fn address(from: &str) -> &str {
+    from.rsplit_once('<')
+        .map_or(from, |(_, a)| a.trim_end_matches('>'))
+        .trim()
+}
+
 /// `"Jane Doe" <jane@x.com>` -> `Jane Doe`
 pub fn display_name(from: &str) -> String {
     match from.split_once('<') {
@@ -510,11 +517,10 @@ fn decode_charset(content_type: &str, bytes: &[u8]) -> String {
     let label = content_type
         .split(';')
         .find_map(|p| {
-            p.trim()
-                .strip_prefix("charset=")
-                .or_else(|| p.trim().strip_prefix("CHARSET="))
+            p.split_once('=')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("charset"))
         })
-        .map(|c| c.trim_matches('"'))
+        .map(|(_, v)| v.trim().trim_matches('"'))
         .unwrap_or("utf-8");
     let enc = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
     enc.decode(bytes).0.into_owned()
@@ -735,7 +741,7 @@ mod tests {
     #[test]
     fn decodes_declared_charset() {
         let m = json!({"payload":{"mimeType":"text/plain",
-            "headers":[{"name":"Content-Type","value":"text/plain; charset=\"ISO-8859-1\""}],
+            "headers":[{"name":"Content-Type","value":"text/plain; Charset = \"ISO-8859-1\""}],
             "body":{"data":URL_SAFE.encode(b"Hyv\xe4\xe4 p\xe4iv\xe4\xe4")}}});
         assert_eq!(parse_message(&m).body, "Hyvää päivää");
     }
@@ -746,5 +752,7 @@ mod tests {
         assert_eq!(dec("4%2F0A%zz"), "4/0A%zz");
         assert_eq!(display_name("\"Jane D\" <j@x.com>"), "Jane D");
         assert_eq!(display_name("<j@x.com>"), "j@x.com");
+        assert_eq!(address("\"Jane\" <J@x.com>"), "J@x.com");
+        assert_eq!(address("j@x.com"), "j@x.com");
     }
 }

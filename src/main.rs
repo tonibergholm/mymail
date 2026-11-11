@@ -256,7 +256,7 @@ impl MailApp {
             Kind::Reply
                 if self
                     .client()
-                    .is_some_and(|c| msg.from.to_lowercase().contains(&c.email.to_lowercase())) =>
+                    .is_some_and(|c| gmail::address(&msg.from).eq_ignore_ascii_case(&c.email)) =>
             {
                 msg.to.clone()
             }
