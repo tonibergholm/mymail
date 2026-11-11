@@ -40,7 +40,7 @@ impl Attach {
 }
 
 /// Gmail's cap on attachments per message.
-const MAX_ATTACH: u64 = 25 << 20;
+const MAX_ATTACH: u64 = 25_000_000;
 
 struct Compose {
     kind: Kind,
@@ -532,6 +532,20 @@ impl MailApp {
             window,
             cx,
             move || {
+                // Check sizes before reading anything, so a huge pick can't exhaust memory.
+                let mut known = 0;
+                for (name, path, original) in &picked {
+                    known += match (path, original) {
+                        (Some(p), _) => std::fs::metadata(p)
+                            .map_err(|e| format!("{name}: {e}"))?
+                            .len(),
+                        (_, Some(a)) => a.size,
+                        _ => 0,
+                    };
+                }
+                if known > MAX_ATTACH {
+                    return Err("Attachments are over Gmail's 25 MB limit.".into());
+                }
                 let mut files = vec![];
                 let mut total = 0;
                 for (name, path, original) in picked {
@@ -585,6 +599,9 @@ impl MailApp {
     }
 
     fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.compose.as_ref().map(|c| c.body.entity_id()) else {
+            return;
+        };
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -596,7 +613,12 @@ impl MailApp {
                 return;
             };
             this.update(cx, |this, cx| {
-                if let Some(c) = this.compose.as_mut().filter(|c| !c.sending) {
+                // The picker doesn't block: only add to the composer that asked.
+                if let Some(c) = this
+                    .compose
+                    .as_mut()
+                    .filter(|c| !c.sending && c.body.entity_id() == draft)
+                {
                     for p in paths {
                         if !c
                             .files
@@ -628,9 +650,14 @@ impl MailApp {
             cx,
             move || gmail::save_download(&a.name, &client.attachment(&m.id, &a.part)?),
             |this, r, _, cx| {
-                if let Ok(path) = r {
+                if let Ok((path, openable)) = r {
                     this.status = format!("Saved to {}", path.display()).into();
-                    cx.open_with_system(&path);
+                    // Untrusted file: open only documents; show anything else in the file manager.
+                    if openable {
+                        cx.open_with_system(&path);
+                    } else {
+                        cx.reveal_path(&path);
+                    }
                 }
             },
         );
@@ -944,7 +971,11 @@ impl MailApp {
                                 .disabled(c.sending)
                                 .label(format!("{}  ×", f.name()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(c) = this.compose.as_mut() {
+                                    if let Some(c) = this
+                                        .compose
+                                        .as_mut()
+                                        .filter(|c| !c.sending && i < c.files.len())
+                                    {
                                         c.files.remove(i);
                                         cx.notify();
                                     }

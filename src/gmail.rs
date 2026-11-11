@@ -179,7 +179,12 @@ pub fn prune_cache() {
             .flatten()
             .flatten()
         {
-            if d.path() != root {
+            let name = d.file_name();
+            let old_format = name
+                .to_string_lossy()
+                .strip_prefix('v')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if old_format && d.path() != root {
                 let _ = std::fs::remove_dir_all(d.path());
             }
         }
@@ -424,7 +429,7 @@ fn find_attachments(part: &Value, html: &str, out: &mut Vec<Attachment>) {
         // An image the HTML already shows inline isn't listed again.
         if cid.is_empty() || !html.contains(&format!("cid:{cid}")) {
             out.push(Attachment {
-                name: decode_words(name),
+                name: strip_tricks(&decode_words(name)),
                 mime: part["mimeType"].as_str().unwrap_or("").into(),
                 size: part["body"]["size"].as_u64().unwrap_or(0),
                 part: part["partId"].as_str().unwrap_or("").into(),
@@ -437,7 +442,9 @@ fn find_attachments(part: &Value, html: &str, out: &mut Vec<Attachment>) {
 }
 
 /// Save to Downloads under a unique, sanitized name; returns the path.
-pub fn save_download(name: &str, data: &[u8]) -> Result<PathBuf> {
+/// Save to Downloads under a unique, sanitized name. Returns the path and whether it is
+/// safe to open directly (a document type, quarantined on macOS); otherwise only reveal it.
+pub fn save_download(name: &str, data: &[u8]) -> Result<(PathBuf, bool)> {
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
         .ok_or("no Downloads folder")?;
@@ -448,28 +455,52 @@ pub fn save_download(name: &str, data: &[u8]) -> Result<PathBuf> {
         .open(&path)
         .map_err(err)?;
     f.write_all(data).map_err(err)?;
-    // Mark it as downloaded, so Gatekeeper asks before running anything executable.
+    // Mark it as downloaded, so Gatekeeper checks it; fail closed if that doesn't work.
     #[cfg(target_os = "macos")]
-    {
+    let marked = {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let _ = std::process::Command::new("xattr")
+        std::process::Command::new("/usr/bin/xattr")
             .args([
                 "-w",
                 "com.apple.quarantine",
                 &format!("0081;{secs:x};MyMail;"),
             ])
             .arg(&path)
-            .status();
-    }
-    Ok(path)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    #[cfg(not(target_os = "macos"))]
+    let marked = true;
+    let doc = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| OPENABLE.contains(&e.to_ascii_lowercase().as_str()));
+    Ok((path, marked && doc))
+}
+
+/// Document types opened straight after download; anything else (scripts, apps,
+/// archives, .desktop files...) is only revealed in the file manager.
+const OPENABLE: &[&str] = &[
+    "pdf", "png", "jpg", "jpeg", "gif", "webp", "heic", "txt", "csv", "ics", "docx", "xlsx",
+    "pptx", "doc", "xls", "ppt", "odt", "ods", "odp", "rtf", "pages", "numbers", "key",
+];
+
+/// Drops control characters and bidi overrides (which make `inv\u{202E}fdp.sh` look like `invhs.pdf`).
+fn strip_tricks(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
+        })
+        .collect()
 }
 
 /// File names come from the sender: keep only a plain last component.
 fn safe_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let base: String = base.chars().filter(|c| !c.is_control()).collect();
+    let base = strip_tricks(base);
     let base = base.trim().trim_start_matches('.');
     if base.is_empty() {
         "attachment".into()
@@ -1122,8 +1153,9 @@ fn b64_lines(data: &[u8]) -> String {
 
 /// `filename="a.pdf"`, or RFC 2231 `filename*=UTF-8''...` for anything non-ASCII.
 fn file_param(key: &str, name: &str) -> String {
-    let name = clean(name);
-    if name.is_ascii() && !name.contains(['"', '\\']) {
+    // Keep the header line well under the 998-character limit.
+    let name: String = clean(name).chars().take(120).collect();
+    if name.bytes().all(|b| (b' '..=b'~').contains(&b)) && !name.contains(['"', '\\']) {
         format!("{key}=\"{name}\"")
     } else {
         format!("{key}*=UTF-8''{}", enc(&name))
@@ -1531,6 +1563,8 @@ mod tests {
         assert_eq!(safe_name("C:\\x\\.bashrc"), "bashrc");
         assert_eq!(safe_name("a\nb.txt"), "ab.txt");
         assert_eq!(safe_name(".."), "attachment");
+        assert_eq!(safe_name("inv\u{202E}fdp.sh"), "invfdp.sh");
+        assert_eq!(file_param("filename", "a\tb.pdf"), "filename*=UTF-8''a%09b.pdf");
         let dir = std::path::Path::new("/d");
         let taken = |p: &std::path::Path| p.ends_with("r.pdf") || p.ends_with("r (1).pdf");
         assert_eq!(unique_path(dir, "r.pdf", taken), dir.join("r (2).pdf"));
