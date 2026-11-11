@@ -694,8 +694,19 @@ fn resolve_cids(
             && t.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b))
     });
-    if safe_mime && !cid.is_empty() && html.contains(&reference) {
-        let data = match part["body"]["data"].as_str() {
+    // Whole references only: "cid:image1" must not match the start of "cid:image10".
+    let hits: Vec<usize> = html
+        .match_indices(&reference)
+        .map(|(i, _)| i)
+        .filter(|&i| {
+            html[i + reference.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == '"' || c == '\'' || c == ')' || c.is_whitespace())
+        })
+        .collect();
+    if safe_mime && !cid.is_empty() && !hits.is_empty() {
+        let data = match part["body"]["data"].as_str().filter(|d| !d.is_empty()) {
             Some(d) => d.to_string(),
             None => match part["body"]["attachmentId"].as_str() {
                 Some(att) => fetch(att)?.as_str().unwrap_or("").to_string(),
@@ -712,10 +723,12 @@ fn resolve_cids(
             })
             .collect();
         let uri = format!("data:{mime};base64,{b64}");
-        let cost = uri.len() * html.matches(&reference).count();
+        let cost = uri.len() * hits.len();
         if cost <= *budget {
             *budget -= cost;
-            html = html.replace(&reference, &uri);
+            for &i in hits.iter().rev() {
+                html.replace_range(i..i + reference.len(), &uri);
+            }
         }
     }
     for p in part["parts"].as_array().into_iter().flatten() {
@@ -1012,6 +1025,21 @@ mod tests {
         .unwrap();
         assert_eq!(out, r#"<img src="data:image/png;base64,ab+/">"#);
         assert_eq!(asked, ["A9"], "unreferenced images are not fetched");
+        // Prefix-colliding ids and empty inline data next to an attachmentId.
+        let two = json!({"parts":[
+            {"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<image1>"}],"body":{"data":"","attachmentId":"P1"}},
+            {"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<image10>"}],"body":{"data":"QQ"}}]});
+        let out = resolve_cids(
+            &two,
+            r#"<img src="cid:image1"><img src="cid:image10">"#,
+            &mut |_| Ok(json!("Zg")),
+            &mut CID_BUDGET.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            r#"<img src="data:image/png;base64,Zg"><img src="data:image/png;base64,QQ">"#
+        );
         // Over budget or a hostile mime type: left as cid: (shows as a broken image, nothing worse).
         let hostile = json!({"mimeType":"image/png\" onerror=\"x","headers":[{"name":"Content-ID","value":"<a@x>"}],"body":{"data":"AAAA"}});
         let html = r#"<img src="cid:a@x">"#;
