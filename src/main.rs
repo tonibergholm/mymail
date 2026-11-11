@@ -3,6 +3,7 @@ mod gmail;
 use gmail::{Client, Message, OAuthClient, SavedAccount, Summary};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{ActiveTheme, Sizable, Theme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -32,6 +33,7 @@ struct MailApp {
     selected: Option<usize>,
     open: Option<Arc<Message>>,
     reader: Entity<TextareaState>,
+    html_view: Entity<TextViewState>,
     compose: Option<Compose>,
     status: SharedString,
     focus: FocusHandle,
@@ -49,6 +51,11 @@ impl MailApp {
             InputState::new(window, cx).placeholder("Search (Gmail syntax, Enter)  — empty = Inbox")
         });
         let reader = cx.new(|cx| TextareaState::new(window, cx).soft_wrap(true));
+        let html_view = cx.new(|cx| {
+            TextViewState::html("", cx)
+                .scrollable(true)
+                .selectable(true)
+        });
         Theme::sync_system_appearance(Some(window), cx);
         let subs = vec![
             cx.observe_window_appearance(window, |_, window, cx| {
@@ -85,6 +92,7 @@ impl MailApp {
             selected: None,
             open: None,
             reader,
+            html_view,
             compose: None,
             status,
             focus: cx.focus_handle(),
@@ -208,8 +216,12 @@ impl MailApp {
                 } else if let Some(x) = this.list.iter_mut().find(|x| x.id == m.id) {
                     x.unread = false;
                 }
-                this.reader
-                    .update(cx, |r, cx| r.set_value(m.body.clone(), window, cx));
+                match &m.html {
+                    Some(h) => this.html_view.update(cx, |v, cx| v.set_text(h, cx)),
+                    None => this
+                        .reader
+                        .update(cx, |r, cx| r.set_value(m.body.clone(), window, cx)),
+                }
                 this.open = Some(Arc::new(m));
             },
         );
@@ -551,13 +563,25 @@ impl MailApp {
                     ),
             );
         }
+        let content = if m.html.is_some() {
+            TextView::new(&self.html_view)
+                .size_full()
+                .into_any_element()
+        } else {
+            Textarea::new(&self.reader)
+                .readonly(true)
+                .bordered(false)
+                .h(relative(1.))
+                .into_any_element()
+        };
         col.child(
-            div().flex_1().min_h_0().p_2().child(
-                Textarea::new(&self.reader)
-                    .readonly(true)
-                    .bordered(false)
-                    .h(relative(1.)),
-            ),
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .p_3()
+                .child(content),
         )
         .into_any_element()
     }
@@ -622,6 +646,7 @@ impl Render for MailApp {
                     .child(
                         div()
                             .w(px(380.))
+                            .flex_none()
                             .h_full()
                             .border_r_1()
                             .border_color(t.border)
@@ -642,6 +667,7 @@ impl Render for MailApp {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0() // wide HTML must not squeeze the list
                             .h_full()
                             .flex()
                             .flex_col()
@@ -668,6 +694,8 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            // Lets HTML mail load remote images.
+            cx.set_http_client(Arc::new(reqwest_client::ReqwestClient::new()));
             cx.on_window_closed(|cx, _| cx.quit()).detach();
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
             gpui_kit::open_window(

@@ -274,7 +274,9 @@ pub struct Message {
     pub date: String,
     pub message_id: String,
     pub references: String,
+    /// Plain text: shown when there is no HTML, and used for reply/forward quoting.
     pub body: String,
+    pub html: Option<String>,
 }
 
 pub struct Client {
@@ -547,7 +549,8 @@ pub fn parse_message(m: &Value) -> Message {
     find_bodies(p, &mut plain, &mut html);
     // Prefer HTML: senders' text/plain parts are often empty, placeholders, or spacer junk.
     let body = html
-        .map(|h| html_to_text(&h))
+        .as_deref()
+        .map(html_to_text)
         .filter(|t| !t.trim().is_empty())
         .or(plain)
         .unwrap_or_default();
@@ -563,6 +566,7 @@ pub fn parse_message(m: &Value) -> Message {
         message_id: header(p, "Message-ID"),
         references: header(p, "References"),
         body: body.replace("\r\n", "\n"),
+        html: html.filter(|h| !h.trim().is_empty()),
     }
 }
 
