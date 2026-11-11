@@ -1,4 +1,6 @@
 mod gmail;
+#[cfg(target_os = "macos")]
+mod web;
 
 use gmail::{Client, Message, OAuthClient, SavedAccount, Summary};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -34,6 +36,9 @@ struct MailApp {
     open: Option<Arc<Message>>,
     reader: Entity<TextareaState>,
     html_view: Entity<TextViewState>,
+    /// Native web view for HTML mail (macOS); gpui-kit's TextView elsewhere.
+    #[cfg(target_os = "macos")]
+    web: Option<std::rc::Rc<web::Web>>,
     compose: Option<Compose>,
     status: SharedString,
     focus: FocusHandle,
@@ -93,6 +98,8 @@ impl MailApp {
             open: None,
             reader,
             html_view,
+            #[cfg(target_os = "macos")]
+            web: web::Web::new(window).map(std::rc::Rc::new),
             compose: None,
             status,
             focus: cx.focus_handle(),
@@ -165,7 +172,10 @@ impl MailApp {
                     return;
                 }
                 this.list = list;
-                this.list.retain(|x| !this.archived.contains(&x.id));
+                if query == "in:inbox" {
+                    // An inbox fetch that began before an archive may still contain it.
+                    this.list.retain(|x| !this.archived.contains(&x.id));
+                }
                 this.list_gen += 1;
                 if let Some(c) = &this.compose {
                     // Don't throw away a draft; just re-point the selection at its message.
@@ -217,7 +227,13 @@ impl MailApp {
                     x.unread = false;
                 }
                 match &m.html {
-                    Some(h) => this.html_view.update(cx, |v, cx| v.set_text(h, cx)),
+                    #[cfg(target_os = "macos")]
+                    Some(h) if this.web.is_some() => this.web.as_ref().unwrap().load(h),
+                    // Fresh state per message so it opens scrolled to the top.
+                    Some(h) => {
+                        this.html_view = cx
+                            .new(|cx| TextViewState::html(h, cx).scrollable(true).selectable(true))
+                    }
                     None => this
                         .reader
                         .update(cx, |r, cx| r.set_value(m.body.clone(), window, cx)),
@@ -469,6 +485,10 @@ impl MailApp {
     }
 
     fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(target_os = "macos")]
+        if let Some(web) = &self.web {
+            web.set_visible(self.open.as_ref().is_some_and(|m| m.html.is_some()));
+        }
         let t = cx.theme();
         let Some(m) = self.open.clone() else {
             return div()
@@ -562,6 +582,13 @@ impl MailApp {
                             ),
                     ),
             );
+        }
+        #[cfg(target_os = "macos")]
+        if let (Some(web), true) = (self.web.clone(), m.html.is_some()) {
+            let pane = canvas(|_, _, _| (), move |bounds, _, _, _| web.place(bounds)).size_full();
+            return col
+                .child(div().flex_1().min_h_0().min_w_0().child(pane))
+                .into_any_element();
         }
         let content = if m.html.is_some() {
             TextView::new(&self.html_view)

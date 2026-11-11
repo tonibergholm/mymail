@@ -548,9 +548,11 @@ pub fn parse_message(m: &Value) -> Message {
     let (mut plain, mut html) = (None, None);
     find_bodies(p, &mut plain, &mut html);
     // Prefer HTML: senders' text/plain parts are often empty, placeholders, or spacer junk.
-    let body = html
-        .as_deref()
-        .map(html_to_text)
+    let html_text = html.as_deref().map(html_to_text).unwrap_or_default();
+    // HTML with nothing visible (no text, no images) counts as absent.
+    let html =
+        html.filter(|h| !html_text.trim().is_empty() || h.to_ascii_lowercase().contains("<img"));
+    let body = Some(html_text)
         .filter(|t| !t.trim().is_empty())
         .or(plain)
         .unwrap_or_default();
@@ -566,7 +568,7 @@ pub fn parse_message(m: &Value) -> Message {
         message_id: header(p, "Message-ID"),
         references: header(p, "References"),
         body: body.replace("\r\n", "\n"),
-        html: html.filter(|h| !h.trim().is_empty()),
+        html,
     }
 }
 
@@ -815,7 +817,12 @@ mod tests {
         let m = json!({"payload":{"mimeType":"multipart/alternative","parts":[
             {"mimeType":"text/plain","body":{"data":URL_SAFE.encode("hi")}},
             {"mimeType":"text/html","body":{"data":URL_SAFE.encode("<div> </div>")}}]}});
-        assert_eq!(parse_message(&m).body, "hi");
+        let msg = parse_message(&m);
+        assert_eq!(msg.body, "hi");
+        assert!(
+            msg.html.is_none(),
+            "reader must fall back to the plain part"
+        );
     }
 
     #[test]
