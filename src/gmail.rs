@@ -545,8 +545,11 @@ pub fn parse_message(m: &Value) -> Message {
     let p = &m["payload"];
     let (mut plain, mut html) = (None, None);
     find_bodies(p, &mut plain, &mut html);
-    let body = plain
-        .or_else(|| html.map(|h| html2text::from_read(h.as_bytes(), 100).unwrap_or(h)))
+    // Prefer HTML: senders' text/plain parts are often empty, placeholders, or spacer junk.
+    let body = html
+        .map(|h| html_to_text(&h))
+        .filter(|t| !t.trim().is_empty())
+        .or(plain)
         .unwrap_or_default();
     Message {
         id: m["id"].as_str().unwrap_or("").into(),
@@ -595,6 +598,36 @@ fn decode_charset(content_type: &str, bytes: &[u8]) -> String {
         .unwrap_or("utf-8");
     let enc = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
     enc.decode(bytes).0.into_owned()
+}
+
+/// Readable plain text: no markup, link footnotes or table borders; lines wrap in the reader.
+fn html_to_text(html: &str) -> String {
+    let text = html2text::config::with_decorator(html2text::render::TrivialDecorator::new())
+        .no_table_borders()
+        .link_footnotes(false)
+        .string_from_read(html.as_bytes(), 400)
+        .unwrap_or_default();
+    // Drop invisible preheader padding and collapse the blank runs that layout tables leave.
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in text.lines() {
+        let line: String = line
+            .chars()
+            .filter(|c| !"\u{34f}\u{200b}\u{200c}\u{200d}\u{2800}\u{ad}\u{feff}".contains(*c))
+            .collect();
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out += line;
+        out += "\n";
+    }
+    out.trim().to_string()
 }
 
 fn find_bodies(part: &Value, plain: &mut Option<String>, html: &mut Option<String>) {
@@ -764,10 +797,21 @@ mod tests {
             "parts":[{"mimeType":"text/html","body":{"data":URL_SAFE.encode("<p>html</p>")}},
                      {"mimeType":"text/plain","body":{"data":data}}]}});
         let msg = parse_message(&m);
-        assert_eq!(msg.body, "hi there");
+        assert_eq!(msg.body, "html"); // HTML wins over text/plain
         assert_eq!(msg.message_id, "<m@x>");
         let m = json!({"payload":{"mimeType":"text/html","body":{"data":URL_SAFE.encode("<p>only <b>html</b></p>")}}});
         assert!(parse_message(&m).body.contains("only"));
+        // Placeholder plain part + real HTML with preheader padding and footnote-free links.
+        let m = json!({"payload":{"mimeType":"multipart/alternative","parts":[
+            {"mimeType":"text/plain","body":{"data":URL_SAFE.encode("Plain text version not available")}},
+            {"mimeType":"text/html","body":{"data":URL_SAFE.encode(
+                "<p>Deal \u{34f}\u{2800}\u{200c} \u{34f}\u{2800}\u{200c}</p><table><tr><td><a href='https://x.y'>Shop</a></td></tr></table>")}}]}});
+        assert_eq!(parse_message(&m).body, "Deal\n\nShop");
+        // Empty HTML falls back to plain.
+        let m = json!({"payload":{"mimeType":"multipart/alternative","parts":[
+            {"mimeType":"text/plain","body":{"data":URL_SAFE.encode("hi")}},
+            {"mimeType":"text/html","body":{"data":URL_SAFE.encode("<div> </div>")}}]}});
+        assert_eq!(parse_message(&m).body, "hi");
     }
 
     #[test]
