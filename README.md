@@ -46,12 +46,17 @@ Gmail needs an OAuth client of your own:
 The app requests one scope, `gmail.modify` (read, label, send). Refresh tokens
 are stored in `accounts.json` in the same directory, with mode 0600.
 
-## Build
+## Install
 
 ```sh
-cargo build --release
-./target/release/mymail
+./scripts/install.sh
 ```
+
+On macOS this builds `MyMail.app` and copies it to `/Applications`. On Linux it
+installs `~/.local/bin/mymail`, an icon, and a desktop entry, so MyMail shows up
+in your launcher (Walker on Omarchy).
+
+To run without installing: `cargo run --release`.
 
 Linux needs the usual GPUI build dependencies (Vulkan, Wayland or X11,
 xkbcommon, fontconfig). See the

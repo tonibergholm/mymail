@@ -701,6 +701,7 @@ fn main() {
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    app_id: Some("mymail".into()), // matches the Linux .desktop entry
                     titlebar: Some(TitlebarOptions {
                         title: Some("MyMail".into()),
                         ..Default::default()
