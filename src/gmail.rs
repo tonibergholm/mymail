@@ -23,6 +23,22 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// One HTTP agent with timeouts, so a stalled network fails instead of hanging forever.
+fn http() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        let s = |n| Some(Duration::from_secs(n));
+        ureq::Agent::config_builder()
+            .timeout_resolve(s(10))
+            .timeout_connect(s(10))
+            .timeout_per_read(s(30))
+            .timeout_per_write(s(30))
+            .timeout_per_call(s(180)) // a large attachment may take a while
+            .build()
+            .into()
+    })
+}
+
 // ---------- config & accounts on disk ----------
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -118,7 +134,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 /// Bump the version when `Message`/`Summary` or parsing changes, so old entries are ignored.
 fn cache_root() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("mymail").join("v1"))
+    Some(dirs::cache_dir()?.join("mymail").join("v2"))
 }
 
 /// None for anything that isn't a safe file name (ids come from the network).
@@ -156,6 +172,9 @@ pub fn save_inbox(email: &str, list: &[Summary]) {
 // shortcut: drops cached messages fetched over 30 days ago; switch to a size cap if the cache grows too big.
 pub fn prune_cache() {
     let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86400);
+    if let Some(v1) = cache_root().and_then(|r| Some(r.parent()?.join("v1"))) {
+        let _ = std::fs::remove_dir_all(v1); // superseded cache format
+    }
     let Some(Ok(accounts)) = cache_root().map(std::fs::read_dir) else {
         return;
     };
@@ -255,7 +274,8 @@ impl Login {
         }
         let code =
             param("code").ok_or_else(|| param("error").unwrap_or_else(|| "no code".into()))?;
-        let resp: Value = ureq::post(TOKEN_URL)
+        let resp: Value = http()
+            .post(TOKEN_URL)
             .send_form([
                 ("code", code.as_str()),
                 ("client_id", &client.client_id),
@@ -273,7 +293,8 @@ impl Login {
             .ok_or("no refresh_token in response")?
             .to_string();
         let access = resp["access_token"].as_str().ok_or("no access_token")?;
-        let profile: Value = ureq::get(format!("{API}/profile"))
+        let profile: Value = http()
+            .get(format!("{API}/profile"))
             .header("Authorization", format!("Bearer {access}"))
             .call()
             .map_err(err)?
@@ -334,6 +355,8 @@ pub struct Summary {
     pub from: String,
     pub subject: String,
     pub date: String,
+    /// When Gmail received it, in ms since the epoch (`internalDate`); 0 if unknown.
+    pub time: i64,
     pub snippet: String,
     pub unread: bool,
 }
@@ -348,6 +371,7 @@ pub struct Message {
     pub cc: String,
     pub subject: String,
     pub date: String,
+    pub time: i64,
     pub message_id: String,
     pub references: String,
     /// Plain text: shown when there is no HTML, and used for reply/forward quoting.
@@ -377,7 +401,8 @@ impl Client {
         if let Some((t, _)) = guard.as_ref().filter(|(_, exp)| *exp > Instant::now()) {
             return Ok(t.clone());
         }
-        let resp: Value = ureq::post(TOKEN_URL)
+        let resp: Value = http()
+            .post(TOKEN_URL)
             .send_form([
                 ("client_id", self.oauth.client_id.as_str()),
                 ("client_secret", &self.oauth.client_secret),
@@ -406,7 +431,8 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        ureq::get(format!("{API}{path}"))
+        http()
+            .get(format!("{API}{path}"))
             .header("Authorization", format!("Bearer {}", self.token()?))
             .call()
             .map_err(err)?
@@ -416,7 +442,8 @@ impl Client {
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
-        ureq::post(format!("{API}{path}"))
+        http()
+            .post(format!("{API}{path}"))
             .header("Authorization", format!("Bearer {}", self.token()?))
             .send_json(body)
             .map_err(err)?
@@ -465,7 +492,12 @@ impl Client {
         let complete = errs.is_empty();
         match (ok.is_empty(), errs.into_iter().next()) {
             (true, Some(Err(e))) => Err(e),
-            _ => Ok((ok.into_iter().map(Result::unwrap).collect(), complete)),
+            _ => {
+                let mut list: Vec<Summary> = ok.into_iter().map(Result::unwrap).collect();
+                // Gmail's list order isn't strictly by date; show newest first like its web UI.
+                list.sort_by_key(|s| std::cmp::Reverse(s.time));
+                Ok((list, complete))
+            }
         }
     }
 
@@ -611,6 +643,13 @@ fn header(payload: &Value, name: &str) -> String {
         .to_string()
 }
 
+fn internal_date(m: &Value) -> i64 {
+    m["internalDate"]
+        .as_str()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0)
+}
+
 fn summary(m: &Value) -> Summary {
     let p = &m["payload"];
     Summary {
@@ -618,6 +657,7 @@ fn summary(m: &Value) -> Summary {
         from: display_name(&decode_words(&header(p, "From"))),
         subject: decode_words(&header(p, "Subject")),
         date: header(p, "Date"),
+        time: internal_date(m),
         snippet: strip_padding(&unescape_html(m["snippet"].as_str().unwrap_or("")))
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -673,6 +713,7 @@ pub fn parse_message(m: &Value) -> Message {
         cc: header(p, "Cc"),
         subject: decode_words(&header(p, "Subject")),
         date: header(p, "Date"),
+        time: internal_date(m),
         message_id: header(p, "Message-ID"),
         references: header(p, "References"),
         body: body.replace("\r\n", "\n"),

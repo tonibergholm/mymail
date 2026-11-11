@@ -4347,6 +4347,7 @@ name = "mymail"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "chrono",
  "dirs 7.0.0",
  "encoding_rs",
  "getrandom 0.3.4",
