@@ -338,10 +338,10 @@ impl MailApp {
         let selected = self.selected == Some(ix);
         v_flex()
             .id(ix)
-            .h(px(64.))
+            .h(px(76.))
             .px_3()
             .py_1()
-            .gap_0p5()
+            .justify_center()
             .border_b_1()
             .border_color(t.border)
             .when(selected, |d| d.bg(t.list_active))
