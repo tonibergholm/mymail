@@ -38,6 +38,8 @@ struct MailApp {
     scroll: UniformListScrollHandle,
     /// Bumped whenever `list` is replaced, so late callbacks can tell it changed.
     list_gen: u64,
+    /// Archived this session; filtered from list results fetched before Gmail caught up.
+    archived: std::collections::HashSet<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -88,6 +90,7 @@ impl MailApp {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             list_gen: 0,
+            archived: Default::default(),
             _subs: subs,
         };
         if app.clients.is_empty() && app.oauth.is_some() {
@@ -154,6 +157,7 @@ impl MailApp {
                     return;
                 }
                 this.list = list;
+                this.list.retain(|x| !this.archived.contains(&x.id));
                 this.list_gen += 1;
                 if let Some(c) = &this.compose {
                     // Don't throw away a draft; just re-point the selection at its message.
@@ -224,6 +228,7 @@ impl MailApp {
         };
         let (summary, list_gen) = (self.list.remove(ix), self.list_gen);
         let id = summary.id.clone();
+        self.archived.insert(id.clone());
         self.open = None;
         self.compose = None;
         self.selected = None;
@@ -236,6 +241,9 @@ impl MailApp {
             cx,
             move || client.archive(&id),
             move |this, r, _, _| {
+                if r.is_err() {
+                    this.archived.remove(&summary.id);
+                }
                 // Optimistic removal: put the row back if Gmail refused.
                 if r.is_err()
                     && this.list_gen == list_gen
@@ -514,8 +522,8 @@ impl MailApp {
                     .border_b_1()
                     .border_color(t.border)
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(Input::new(&c.to))
-                    .child(Textarea::new(&c.body).h(px(180.)))
+                    .child(Input::new(&c.to).disabled(c.sending))
+                    .child(Textarea::new(&c.body).h(px(180.)).disabled(c.sending))
                     .child(
                         h_flex()
                             .gap_2()
