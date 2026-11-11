@@ -525,12 +525,23 @@ impl MailApp {
                     .border_b_1()
                     .border_color(t.border)
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(m.subject.clone()),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(m.subject.clone()),
+                            )
+                            // Real sender stays in native UI: mail CSS can restyle the in-content header.
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(t.muted_foreground)
+                                    .child(gmail::decode_words(&m.from)),
+                            ),
                     )
                     .child(act("reply", "Reply").on_click(
                         cx.listener(|this, _, w, cx| this.start_compose(Kind::Reply, w, cx)),
