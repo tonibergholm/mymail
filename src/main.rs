@@ -550,8 +550,11 @@ impl MailApp {
         self.compose = None;
         self.history = None;
         // Show the last known inbox at once (opening from the message cache), then update it.
+        // The cache only stands in for the inbox, not for an active search.
+        let inbox = self.search.read(cx).value().trim().is_empty();
         self.list = self
             .client()
+            .filter(|_| inbox)
             .map(|c| gmail::cached_inbox(&c.email))
             .unwrap_or_default();
         self.list.retain(|x| !self.archived.contains(&x.id));
