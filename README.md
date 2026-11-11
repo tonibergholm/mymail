@@ -5,8 +5,13 @@
 A small, fast Gmail client for macOS and Linux (Omarchy / Wayland), written in
 Rust with [GPUI](https://gpui.rs) and [GPUI Kit](https://gpui-kit.com).
 
-It does six things: search, read, write, reply, forward, archive. It works with
+It does six things: search, read, write, reply, forward, archive, with
+attachments both ways. It works with
 Gmail and Google Workspace accounts, and you can sign in to several.
+
+Click an attachment to save it to Downloads and open it. In the composer,
+**Attach…** adds files (up to Gmail's 25 MB), and Forward keeps the original
+message's attachments.
 
 The inbox checks for new mail every 60 seconds; a check that finds nothing new
 costs one small request. Messages you have opened are cached on disk, so they

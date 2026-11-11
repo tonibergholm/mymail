@@ -134,7 +134,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 /// Bump the version when `Message`/`Summary` or parsing changes, so old entries are ignored.
 fn cache_root() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("mymail").join("v2"))
+    Some(dirs::cache_dir()?.join("mymail").join("v3"))
 }
 
 /// None for anything that isn't a safe file name (ids come from the network).
@@ -172,8 +172,17 @@ pub fn save_inbox(email: &str, list: &[Summary]) {
 // shortcut: drops cached messages fetched over 30 days ago; switch to a size cap if the cache grows too big.
 pub fn prune_cache() {
     let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86400);
-    if let Some(v1) = cache_root().and_then(|r| Some(r.parent()?.join("v1"))) {
-        let _ = std::fs::remove_dir_all(v1); // superseded cache format
+    if let Some(root) = cache_root() {
+        // Drop superseded cache formats.
+        for d in std::fs::read_dir(root.parent().unwrap_or(&root))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if d.path() != root {
+                let _ = std::fs::remove_dir_all(d.path());
+            }
+        }
     }
     let Some(Ok(accounts)) = cache_root().map(std::fs::read_dir) else {
         return;
@@ -377,6 +386,137 @@ pub struct Message {
     /// Plain text: shown when there is no HTML, and used for reply/forward quoting.
     pub body: String,
     pub html: Option<String>,
+    /// Files to download; inline images shown in the HTML are left out.
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    /// Gmail `partId`, stable across fetches (unlike `attachmentId`).
+    pub part: String,
+}
+
+/// A file to send.
+pub struct File {
+    pub name: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+fn find_part<'a>(part: &'a Value, id: &str) -> Option<&'a Value> {
+    if part["partId"].as_str() == Some(id) {
+        return Some(part);
+    }
+    part["parts"]
+        .as_array()?
+        .iter()
+        .find_map(|p| find_part(p, id))
+}
+
+fn find_attachments(part: &Value, html: &str, out: &mut Vec<Attachment>) {
+    let name = part["filename"].as_str().unwrap_or("");
+    if !name.is_empty() {
+        let cid = header(part, "Content-ID");
+        let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
+        // An image the HTML already shows inline isn't listed again.
+        if cid.is_empty() || !html.contains(&format!("cid:{cid}")) {
+            out.push(Attachment {
+                name: decode_words(name),
+                mime: part["mimeType"].as_str().unwrap_or("").into(),
+                size: part["body"]["size"].as_u64().unwrap_or(0),
+                part: part["partId"].as_str().unwrap_or("").into(),
+            });
+        }
+    }
+    for p in part["parts"].as_array().into_iter().flatten() {
+        find_attachments(p, html, out);
+    }
+}
+
+/// Save to Downloads under a unique, sanitized name; returns the path.
+pub fn save_download(name: &str, data: &[u8]) -> Result<PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or("no Downloads folder")?;
+    let path = unique_path(&dir, &safe_name(name), |p| p.exists());
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(err)?;
+    f.write_all(data).map_err(err)?;
+    // Mark it as downloaded, so Gatekeeper asks before running anything executable.
+    #[cfg(target_os = "macos")]
+    {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let _ = std::process::Command::new("xattr")
+            .args([
+                "-w",
+                "com.apple.quarantine",
+                &format!("0081;{secs:x};MyMail;"),
+            ])
+            .arg(&path)
+            .status();
+    }
+    Ok(path)
+}
+
+/// File names come from the sender: keep only a plain last component.
+fn safe_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let base: String = base.chars().filter(|c| !c.is_control()).collect();
+    let base = base.trim().trim_start_matches('.');
+    if base.is_empty() {
+        "attachment".into()
+    } else {
+        base.into()
+    }
+}
+
+/// `report.pdf` -> `report (1).pdf`, ... until `taken` says no.
+fn unique_path(
+    dir: &std::path::Path,
+    name: &str,
+    taken: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    let mut path = dir.join(name);
+    let mut n = 1;
+    while taken(&path) {
+        path = dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    path
+}
+
+/// MIME type for a file being attached, from its extension.
+pub fn guess_mime(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|x| x.1.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("heic") => "image/heic",
+        Some("txt") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("html" | "htm") => "text/html",
+        Some("zip") => "application/zip",
+        Some("ics") => "text/calendar",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
 }
 
 pub struct Client {
@@ -439,6 +579,8 @@ impl Client {
             .call()
             .map_err(err)?
             .body_mut()
+            .with_config()
+            .limit(64 << 20) // a 25 MB attachment is ~34 MB as base64 JSON
             .read_json()
             .map_err(err)
     }
@@ -550,12 +692,45 @@ impl Client {
         self.modify(id, &["INBOX"])
     }
 
+    /// Uses the upload endpoint, which takes messages up to 35 MB (attachments included).
     pub fn send(&self, raw: &str, thread_id: Option<&str>) -> Result<()> {
-        let mut body = json!({ "raw": URL_SAFE.encode(raw) });
-        if let Some(t) = thread_id {
-            body["threadId"] = t.into();
-        }
-        self.post("/messages/send", body).map(|_| ())
+        let meta = match thread_id {
+            Some(t) => json!({ "threadId": t }),
+            None => json!({}),
+        };
+        let b = random_b64(18);
+        let body = format!(
+            "--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n\
+             --{b}\r\nContent-Type: message/rfc822\r\n\r\n{raw}\r\n--{b}--\r\n"
+        );
+        http()
+            .post("https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=multipart")
+            .header("Authorization", format!("Bearer {}", self.token()?))
+            .header("Content-Type", format!("multipart/related; boundary={b}"))
+            .send(body.as_bytes())
+            .map_err(err)
+            .map(|_| ())
+    }
+
+    /// Download one attachment. Looks the part up again by its stable part id, because
+    /// Gmail's attachment ids change between fetches and a cached one may have expired.
+    pub fn attachment(&self, msg_id: &str, part: &str) -> Result<Vec<u8>> {
+        let m = self.get(&format!("/messages/{msg_id}?format=full"))?;
+        let p = find_part(&m["payload"], part).ok_or("attachment not found")?;
+        let data = match p["body"]["data"].as_str().filter(|d| !d.is_empty()) {
+            Some(d) => d.to_string(),
+            None => {
+                let att = p["body"]["attachmentId"]
+                    .as_str()
+                    .ok_or("no attachment data")?;
+                let v = self.get(&format!("/messages/{msg_id}/attachments/{att}"))?;
+                v["data"].as_str().unwrap_or("").to_string()
+            }
+        };
+        URL_SAFE
+            .decode(&data)
+            .or_else(|_| URL_SAFE_NO_PAD.decode(&data))
+            .map_err(err)
     }
 }
 
@@ -702,6 +877,8 @@ pub fn parse_message(m: &Value) -> Message {
     // HTML with nothing visible (no text, no images) counts as absent.
     let html =
         html.filter(|h| !html_text.trim().is_empty() || h.to_ascii_lowercase().contains("<img"));
+    let mut attachments = vec![];
+    find_attachments(p, html.as_deref().unwrap_or(""), &mut attachments);
     let body = Some(html_text)
         .filter(|t| !t.trim().is_empty())
         .or(plain)
@@ -720,6 +897,7 @@ pub fn parse_message(m: &Value) -> Message {
         references: header(p, "References"),
         body: body.replace("\r\n", "\n"),
         html,
+        attachments,
     }
 }
 
@@ -932,9 +1110,36 @@ pub fn prefixed(prefix: &str, subject: &str) -> String {
     }
 }
 
-fn build(from: &str, to: &str, subject: &str, extra: &[(&str, &str)], body: &str) -> String {
+fn b64_lines(data: &[u8]) -> String {
+    let b64 = STANDARD.encode(data);
+    let mut out = String::with_capacity(b64.len() + b64.len() / 38);
+    for chunk in b64.as_bytes().chunks(76) {
+        out += std::str::from_utf8(chunk).unwrap();
+        out += "\r\n";
+    }
+    out
+}
+
+/// `filename="a.pdf"`, or RFC 2231 `filename*=UTF-8''...` for anything non-ASCII.
+fn file_param(key: &str, name: &str) -> String {
+    let name = clean(name);
+    if name.is_ascii() && !name.contains(['"', '\\']) {
+        format!("{key}=\"{name}\"")
+    } else {
+        format!("{key}*=UTF-8''{}", enc(&name))
+    }
+}
+
+fn build(
+    from: &str,
+    to: &str,
+    subject: &str,
+    extra: &[(&str, &str)],
+    body: &str,
+    files: &[File],
+) -> String {
     let mut out = format!(
-        "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n",
+        "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\n",
         clean(from),
         clean(to),
         encode_word(&clean(subject))
@@ -944,16 +1149,38 @@ fn build(from: &str, to: &str, subject: &str, extra: &[(&str, &str)], body: &str
             out += &format!("{k}: {}\r\n", clean(v));
         }
     }
-    out += "\r\n";
-    let b64 = STANDARD.encode(body.replace("\r\n", "\n").replace('\n', "\r\n"));
-    for chunk in b64.as_bytes().chunks(76) {
-        out += std::str::from_utf8(chunk).unwrap();
-        out += "\r\n";
+    let text = format!(
+        "Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+        b64_lines(body.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes())
+    );
+    if files.is_empty() {
+        return out + &text;
     }
-    out
+    let b = format!("mymail-{}", random_b64(18));
+    out += &format!("Content-Type: multipart/mixed; boundary=\"{b}\"\r\n\r\n--{b}\r\n{text}");
+    for f in files {
+        // The mime type is ours or Gmail's, but keep it to a plain token anyway.
+        let mime = if !f.mime.is_empty()
+            && f.mime
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/+.-".contains(&c))
+        {
+            f.mime.as_str()
+        } else {
+            "application/octet-stream"
+        };
+        out += &format!(
+            "--{b}\r\nContent-Type: {mime}; {}\r\nContent-Disposition: attachment; {}\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n{}",
+            file_param("name", &f.name),
+            file_param("filename", &f.name),
+            b64_lines(&f.data)
+        );
+    }
+    out + &format!("--{b}--\r\n")
 }
 
-pub fn reply_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
+pub fn reply_raw(me: &str, to: &str, msg: &Message, text: &str, files: &[File]) -> String {
     let refs = format!("{} {}", msg.references, msg.message_id)
         .trim()
         .to_string();
@@ -963,14 +1190,15 @@ pub fn reply_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
         &prefixed("Re:", &msg.subject),
         &[("In-Reply-To", &msg.message_id), ("References", &refs)],
         &format!("{text}\n{}", quote(msg)),
+        files,
     )
 }
 
-pub fn new_raw(me: &str, to: &str, subject: &str, text: &str) -> String {
-    build(me, to, subject, &[], text)
+pub fn new_raw(me: &str, to: &str, subject: &str, text: &str, files: &[File]) -> String {
+    build(me, to, subject, &[], text, files)
 }
 
-pub fn forward_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
+pub fn forward_raw(me: &str, to: &str, msg: &Message, text: &str, files: &[File]) -> String {
     let fwd = format!(
         "{text}\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}",
         decode_words(&msg.from),
@@ -979,7 +1207,7 @@ pub fn forward_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
         decode_words(&msg.to),
         msg.body
     );
-    build(me, to, &prefixed("Fwd:", &msg.subject), &[], &fwd)
+    build(me, to, &prefixed("Fwd:", &msg.subject), &[], &fwd, files)
 }
 
 #[cfg(test)]
@@ -1013,7 +1241,7 @@ mod tests {
 
     #[test]
     fn reply_threads_and_quotes() {
-        let raw = reply_raw("me@x.com", "Jane <jane@x.com>", &sample(), "Thanks");
+        let raw = reply_raw("me@x.com", "Jane <jane@x.com>", &sample(), "Thanks", &[]);
         assert!(raw.contains("Subject: Re: Hello\r\n"));
         assert!(raw.contains("In-Reply-To: <abc@x.com>\r\n"));
         assert!(raw.contains("References: <prev@x.com> <abc@x.com>\r\n"));
@@ -1024,7 +1252,13 @@ mod tests {
 
     #[test]
     fn forward_and_header_injection() {
-        let raw = forward_raw("me@x.com", "a@b.c\r\nBcc: evil@x.com", &sample(), "fyi");
+        let raw = forward_raw(
+            "me@x.com",
+            "a@b.c\r\nBcc: evil@x.com",
+            &sample(),
+            "fyi",
+            &[],
+        );
         assert!(raw.contains("Subject: Fwd: Hello\r\n"));
         assert!(!raw.contains("\r\nBcc:"));
         assert!(decode_body(&raw).contains("Forwarded message"));
@@ -1035,7 +1269,7 @@ mod tests {
         assert_eq!(prefixed("Re:", "RE: x"), "RE: x");
         let mut m = sample();
         m.subject = "Hyvää päivää".into();
-        let raw = reply_raw("me@x.com", "a@b.c", &m, "");
+        let raw = reply_raw("me@x.com", "a@b.c", &m, "", &[]);
         assert!(raw.contains("Subject: =?UTF-8?B?"));
     }
 
@@ -1231,9 +1465,75 @@ mod tests {
 
     #[test]
     fn new_mail_has_subject_and_no_thread_headers() {
-        let raw = new_raw("me@x.com", "a@y.com", "Hi\r\nBcc: evil@z", "body");
+        let raw = new_raw("me@x.com", "a@y.com", "Hi\r\nBcc: evil@z", "body", &[]);
         assert!(raw.contains("Subject: Hi  Bcc: evil@z\r\n"));
         assert!(!raw.contains("In-Reply-To"));
         assert_eq!(decode_body(&raw), "body");
+    }
+
+    #[test]
+    fn attachments_go_in_multipart_mixed() {
+        let files = [File {
+            name: "Käyttö \"x\".pdf".into(),
+            mime: "application/pdf\r\nX: y".into(),
+            data: b"%PDF".to_vec(),
+        }];
+        let raw = new_raw("me@x.com", "a@y.com", "Hi", "body", &files);
+        let b = raw
+            .split("boundary=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let parts: Vec<&str> = raw.split(&format!("--{b}")).collect();
+        assert_eq!(parts.len(), 4, "preamble, text, file, end");
+        assert!(parts[1].contains("text/plain"));
+        // A bad mime type falls back; a non-ASCII name uses RFC 2231.
+        assert!(
+            parts[2].contains("Content-Type: application/octet-stream; name*=UTF-8''K%C3%A4ytt")
+        );
+        assert!(parts[2].contains("Content-Disposition: attachment; filename*=UTF-8''"));
+        let b64: String = parts[2]
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap()
+            .split("\r\n")
+            .collect();
+        assert_eq!(STANDARD.decode(b64).unwrap(), b"%PDF");
+        assert_eq!(parts[3], "--\r\n");
+    }
+
+    #[test]
+    fn lists_files_but_not_inline_images() {
+        let m = json!({"payload": {"mimeType": "multipart/mixed", "parts": [
+            {"partId": "0", "mimeType": "text/html", "body": {"data": URL_SAFE.encode("<img src=\"cid:logo\">hi")}},
+            {"partId": "1", "mimeType": "image/png", "filename": "logo.png",
+             "headers": [{"name": "Content-ID", "value": "<logo>"}], "body": {"size": 10}},
+            {"partId": "2", "mimeType": "application/pdf", "filename": "=?UTF-8?Q?r=C3=A4portti.pdf?=",
+             "body": {"size": 2048, "attachmentId": "A"}}
+        ]}});
+        let a = parse_message(&m).attachments;
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            (a[0].name.as_str(), a[0].part.as_str(), a[0].size),
+            ("räportti.pdf", "2", 2048)
+        );
+        assert_eq!(
+            find_part(&m["payload"], "2").unwrap()["body"]["attachmentId"],
+            "A"
+        );
+    }
+
+    #[test]
+    fn download_names_are_safe_and_unique() {
+        assert_eq!(safe_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_name("C:\\x\\.bashrc"), "bashrc");
+        assert_eq!(safe_name("a\nb.txt"), "ab.txt");
+        assert_eq!(safe_name(".."), "attachment");
+        let dir = std::path::Path::new("/d");
+        let taken = |p: &std::path::Path| p.ends_with("r.pdf") || p.ends_with("r (1).pdf");
+        assert_eq!(unique_path(dir, "r.pdf", taken), dir.join("r (2).pdf"));
+        assert_eq!(unique_path(dir, "README", |_| false), dir.join("README"));
     }
 }

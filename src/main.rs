@@ -8,7 +8,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{
-    ActiveTheme, Sizable, Theme, h_flex, h_resizable, resizable_panel, v_flex,
+    ActiveTheme, Disableable, Sizable, Theme, h_flex, h_resizable, resizable_panel, v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -21,6 +21,27 @@ enum Kind {
     Forward,
 }
 
+enum Attach {
+    /// A file picked from disk.
+    Local(std::path::PathBuf),
+    /// An attachment of the forwarded message, fetched from Gmail at send time.
+    Original(gmail::Attachment),
+}
+
+impl Attach {
+    fn name(&self) -> String {
+        match self {
+            Attach::Local(p) => p
+                .file_name()
+                .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned()),
+            Attach::Original(a) => a.name.clone(),
+        }
+    }
+}
+
+/// Gmail's cap on attachments per message.
+const MAX_ATTACH: u64 = 25 << 20;
+
 struct Compose {
     kind: Kind,
     /// The message replied to or forwarded; None for new mail.
@@ -28,6 +49,7 @@ struct Compose {
     to: Entity<InputState>,
     subject: Entity<InputState>,
     body: Entity<TextareaState>,
+    files: Vec<Attach>,
     sending: bool,
 }
 
@@ -160,6 +182,7 @@ impl MailApp {
             !c.body.read(cx).value().trim().is_empty()
                 || (c.kind == Kind::New && typed(&c.subject))
                 || (c.kind != Kind::Reply && typed(&c.to))
+                || c.files.iter().any(|f| matches!(f, Attach::Local(_)))
         })
     }
 
@@ -453,12 +476,22 @@ impl MailApp {
             Kind::Reply => body.update(cx, |b, cx| b.focus(window, cx)),
             _ => to.update(cx, |t, cx| t.focus(window, cx)),
         }
+        let files = match (&msg, kind) {
+            (Some(m), Kind::Forward) => m
+                .attachments
+                .iter()
+                .cloned()
+                .map(Attach::Original)
+                .collect(),
+            _ => vec![],
+        };
         self.compose = Some(Compose {
             kind,
             msg: if kind == Kind::New { None } else { msg },
             to,
             subject,
             body,
+            files,
             sending: false,
         });
         cx.notify();
@@ -480,21 +513,56 @@ impl MailApp {
         let text = c.body.read(cx).value().to_string();
         let subject = c.subject.read(cx).value().trim().to_string();
         let (kind, msg) = (c.kind, c.msg.clone());
+        let picked: Vec<(
+            String,
+            Option<std::path::PathBuf>,
+            Option<gmail::Attachment>,
+        )> = c
+            .files
+            .iter()
+            .map(|f| match f {
+                Attach::Local(p) => (f.name(), Some(p.clone()), None),
+                Attach::Original(a) => (f.name(), None, Some(a.clone())),
+            })
+            .collect();
         c.sending = true;
         let draft = c.body.entity_id();
         self.run(
             "Sending…",
             window,
             cx,
-            move || match (kind, msg) {
-                (Kind::Reply, Some(msg)) => client.send(
-                    &gmail::reply_raw(&client.email, &to, &msg, &text),
-                    Some(&msg.thread_id),
-                ),
-                (Kind::Forward, Some(msg)) => {
-                    client.send(&gmail::forward_raw(&client.email, &to, &msg, &text), None)
+            move || {
+                let mut files = vec![];
+                let mut total = 0;
+                for (name, path, original) in picked {
+                    let data = match (path, &original, &msg) {
+                        (Some(p), _, _) => std::fs::read(&p).map_err(|e| format!("{name}: {e}"))?,
+                        (_, Some(a), Some(m)) => client.attachment(&m.id, &a.part)?,
+                        _ => continue,
+                    };
+                    total += data.len() as u64;
+                    if total > MAX_ATTACH {
+                        return Err("Attachments are over Gmail's 25 MB limit.".into());
+                    }
+                    let mime = original
+                        .map(|a| a.mime)
+                        .unwrap_or_else(|| gmail::guess_mime(&name).into());
+                    files.push(gmail::File { name, mime, data });
                 }
-                _ => client.send(&gmail::new_raw(&client.email, &to, &subject, &text), None),
+                match (kind, msg) {
+                    (Kind::Reply, Some(msg)) => client.send(
+                        &gmail::reply_raw(&client.email, &to, &msg, &text, &files),
+                        Some(&msg.thread_id),
+                    ),
+                    (Kind::Forward, Some(msg)) => client.send(
+                        &gmail::forward_raw(&client.email, &to, &msg, &text, &files),
+                        None,
+                    ),
+                    _ => client.send(
+                        &gmail::new_raw(&client.email, &to, &subject, &text, &files),
+                        None,
+                    ),
+                }
             },
             move |this, r, window, cx| {
                 // Only touch the composer that sent; another may have opened meanwhile.
@@ -512,6 +580,58 @@ impl MailApp {
                 this.compose = None;
                 this.status = "Sent.".into();
                 this.focus.focus(window, cx);
+            },
+        );
+    }
+
+    fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(c) = this.compose.as_mut().filter(|c| !c.sending) {
+                    for p in paths {
+                        if !c
+                            .files
+                            .iter()
+                            .any(|f| matches!(f, Attach::Local(q) if *q == p))
+                        {
+                            c.files.push(Attach::Local(p));
+                        }
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Save an attachment of the open message to Downloads and open it.
+    fn download(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(m), Some(client)) = (self.open.clone(), self.client()) else {
+            return;
+        };
+        let Some(a) = m.attachments.get(ix).cloned() else {
+            return;
+        };
+        self.run(
+            &format!("Downloading {}…", a.name),
+            window,
+            cx,
+            move || gmail::save_download(&a.name, &client.attachment(&m.id, &a.part)?),
+            |this, r, _, cx| {
+                if let Ok(path) = r {
+                    this.status = format!("Saved to {}", path.display()).into();
+                    cx.open_with_system(&path);
+                }
             },
         );
     }
@@ -737,6 +857,25 @@ impl MailApp {
                             .on_click(cx.listener(|this, _, w, cx| this.archive(w, cx))),
                     ),
             );
+        if !m.attachments.is_empty() {
+            let t = cx.theme();
+            col = col.child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(t.border)
+                    .children(m.attachments.iter().enumerate().map(|(i, a)| {
+                        Button::new(("att", i))
+                            .ghost()
+                            .xsmall()
+                            .label(format!("📎 {}  {}", a.name, human_size(a.size)))
+                            .on_click(cx.listener(move |this, _, w, cx| this.download(i, w, cx)))
+                    })),
+            );
+        }
         if let Some(c) = &self.compose {
             col = col.child(self.render_compose(c, cx));
         }
@@ -793,6 +932,26 @@ impl MailApp {
                     .h(px(if new { 320. } else { 180. }))
                     .disabled(c.sending),
             )
+            .when(!c.files.is_empty(), |d| {
+                d.child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(c.files.iter().enumerate().map(|(i, f)| {
+                            Button::new(("file", i))
+                                .outline()
+                                .xsmall()
+                                .disabled(c.sending)
+                                .label(format!("{}  ×", f.name()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(c) = this.compose.as_mut() {
+                                        c.files.remove(i);
+                                        cx.notify();
+                                    }
+                                }))
+                        })),
+                )
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -803,6 +962,14 @@ impl MailApp {
                             .loading(c.sending)
                             .label("Send")
                             .on_click(cx.listener(|this, _, w, cx| this.send(w, cx))),
+                    )
+                    .child(
+                        Button::new("attach")
+                            .ghost()
+                            .small()
+                            .disabled(c.sending)
+                            .label("Attach…")
+                            .on_click(cx.listener(|this, _, w, cx| this.attach_files(w, cx))),
                     )
                     .child(
                         Button::new("cancel")
@@ -865,6 +1032,14 @@ fn details_html(m: &Message) -> String {
         "<div style=\"font:12px/1.6 -apple-system,system-ui,sans-serif;color:#333;background:#fff;\
          padding:8px 14px;border-bottom:1px solid #e5e5e5;text-align:left\">{rows}</div>"
     )
+}
+
+fn human_size(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{} KB", n / 1024),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
 }
 
 fn local(ms: i64) -> Option<chrono::DateTime<chrono::Local>> {
