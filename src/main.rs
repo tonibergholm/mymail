@@ -16,14 +16,17 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
+    New,
     Reply,
     Forward,
 }
 
 struct Compose {
     kind: Kind,
-    msg: Arc<Message>,
+    /// The message replied to or forwarded; None for new mail.
+    msg: Option<Arc<Message>>,
     to: Entity<InputState>,
+    subject: Entity<InputState>,
     body: Entity<TextareaState>,
     sending: bool,
 }
@@ -50,6 +53,8 @@ struct MailApp {
     list_gen: u64,
     /// Archived this session; filtered from list results fetched before Gmail caught up.
     archived: std::collections::HashSet<String>,
+    /// Mailbox historyId at the last inbox load; polling refreshes when it moves.
+    history: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -71,7 +76,7 @@ impl MailApp {
             }),
             cx.subscribe_in(&search, window, |this, _, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::PressEnter { .. }) {
-                    this.refresh(window, cx);
+                    this.refresh(false, window, cx);
                     this.focus.focus(window, cx);
                 }
             }),
@@ -109,15 +114,57 @@ impl MailApp {
             scroll: UniformListScrollHandle::new(),
             list_gen: 0,
             archived: Default::default(),
+            history: None,
             _subs: subs,
         };
         if app.clients.is_empty() && app.oauth.is_some() {
-            app.status = "No accounts yet. Click “+ Account” to sign in with Google.".into();
+            app.status = "No accounts yet. Use the account menu to sign in with Google.".into();
         } else {
-            app.refresh(window, cx);
+            app.switch_account(0, window, cx);
         }
         app.focus.focus(window, cx);
+        cx.background_spawn(async { gmail::prune_cache() }).detach();
+        let secs = gmail::poll_secs();
+        if secs > 0 {
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(secs))
+                        .await;
+                    let alive = this.update_in(cx, |this, window, cx| {
+                        // Only the inbox view auto-updates; a search result stays put.
+                        if this.search.read(cx).value().trim().is_empty() {
+                            this.refresh(true, window, cx);
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         app
+    }
+
+    /// Typed text in an open composer that navigating away would throw away.
+    fn draft_dirty(&self, cx: &App) -> bool {
+        self.compose.as_ref().is_some_and(|c| {
+            let typed = |s: &Entity<InputState>| !s.read(cx).value().trim().is_empty();
+            !c.body.read(cx).value().trim().is_empty()
+                || (c.kind == Kind::New && typed(&c.subject))
+                || (c.kind != Kind::Reply && typed(&c.to))
+        })
+    }
+
+    /// Refuse an action that would discard a typed draft.
+    fn keep_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let dirty = self.draft_dirty(cx);
+        if dirty {
+            self.status = "Send or cancel the draft first.".into();
+            cx.notify();
+        }
+        dirty
     }
 
     fn client(&self) -> Option<Arc<Client>> {
@@ -133,16 +180,21 @@ impl MailApp {
         job: impl FnOnce() -> gmail::Result<T> + Send + 'static,
         done: impl FnOnce(&mut Self, gmail::Result<T>, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        self.status = label.to_string().into();
-        cx.notify();
+        // An empty label is background work: it only reports errors.
+        let quiet = label.is_empty();
+        if !quiet {
+            self.status = label.to_string().into();
+            cx.notify();
+        }
         let task = cx.background_spawn(async move { job() });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |this, window, cx| {
-                this.status = match &result {
-                    Ok(_) => SharedString::default(),
-                    Err(e) => e.clone().into(),
-                };
+                match &result {
+                    Ok(_) if quiet => {}
+                    Ok(_) => this.status = SharedString::default(),
+                    Err(e) => this.status = e.clone().into(),
+                }
                 done(this, result, window, cx);
                 cx.notify();
             })
@@ -151,7 +203,9 @@ impl MailApp {
         .detach();
     }
 
-    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `quiet`: a background update that keeps the selection and open message,
+    /// and skips the reload when the mailbox hasn't changed since the last one.
+    fn refresh(&mut self, quiet: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let q = self.search.read(cx).value().trim().to_string();
         let q = if q.is_empty() {
@@ -159,31 +213,61 @@ impl MailApp {
         } else {
             q
         };
+        let inbox = q == "in:inbox";
+        let last = self.history.clone().filter(|_| quiet && inbox);
         let (account, query) = (client.clone(), q.clone());
         self.run(
-            "Loading…",
+            if quiet { "" } else { "Loading…" },
             window,
             cx,
-            move || client.list(&q),
-            move |this, list, window, cx| {
-                let Ok(list) = list else { return };
+            move || {
+                // Read the history id first so a change during the list fetch isn't missed.
+                let h = if inbox {
+                    client.history_id().ok()
+                } else {
+                    None
+                };
+                if last.is_some() && h == last {
+                    return Ok(None);
+                }
+                let (list, complete) = client.list(&q)?;
+                if inbox && complete {
+                    gmail::save_inbox(&client.email, &list);
+                }
+                // A partial load must not count as in sync, or polls would skip the retry.
+                Ok(Some((h.filter(|_| complete), list)))
+            },
+            move |this, r, window, cx| {
+                let Ok(Some((h, list))) = r else { return };
                 // Drop stale results if the user switched account or query meanwhile.
                 let now = this.search.read(cx).value().trim().to_string();
                 if !this.client().is_some_and(|c| Arc::ptr_eq(&c, &account))
-                    || (now != query && !(now.is_empty() && query == "in:inbox"))
+                    || (now != query && !(now.is_empty() && inbox))
                 {
                     return;
                 }
+                if inbox {
+                    this.history = h;
+                }
+                let keep = this
+                    .selected
+                    .and_then(|i| this.list.get(i))
+                    .map(|x| x.id.clone());
                 this.list = list;
-                if query == "in:inbox" {
+                if inbox {
                     // An inbox fetch that began before an archive may still contain it.
                     this.list.retain(|x| !this.archived.contains(&x.id));
                 }
                 this.list_gen += 1;
-                if let Some(c) = &this.compose {
-                    // Don't throw away a draft; just re-point the selection at its message.
-                    let id = &c.msg.id;
-                    this.selected = this.list.iter().position(|x| &x.id == id);
+                let draft_of = this
+                    .compose
+                    .as_ref()
+                    .map(|c| c.msg.as_ref().map(|m| m.id.clone()));
+                if quiet || draft_of.is_some() {
+                    // Don't throw away a draft or yank the reader; just re-point the selection.
+                    let id = draft_of.flatten().or(keep);
+                    // Never auto-open here: opening marks the message read.
+                    this.selected = id.and_then(|id| this.list.iter().position(|x| x.id == id));
                     return;
                 }
                 this.selected = None;
@@ -207,6 +291,9 @@ impl MailApp {
         let (Some(ix), Some(client)) = (self.selected, self.client()) else {
             return;
         };
+        if self.keep_draft(cx) {
+            return;
+        }
         let s = self.list[ix].clone();
         self.compose = None;
         self.open = None; // actions must not target the previous message while this one loads
@@ -214,20 +301,33 @@ impl MailApp {
             "Opening…",
             window,
             cx,
-            move || {
-                let m = client.message(&s.id)?;
-                let marked = !s.unread || client.modify(&s.id, &["UNREAD"]).is_ok();
-                Ok((m, marked))
+            {
+                let client = client.clone();
+                let id = s.id.clone();
+                move || client.message(&id)
             },
             move |this, r, window, cx| {
-                let Ok((m, marked)) = r else { return };
+                let Ok(m) = r else { return };
                 if this.selected.and_then(|i| this.list.get(i)).map(|x| &x.id) != Some(&m.id) {
                     return; // user moved on
                 }
-                if !marked {
-                    this.status = "Couldn't mark as read.".into();
-                } else if let Some(x) = this.list.iter_mut().find(|x| x.id == m.id) {
-                    x.unread = false;
+                if s.unread {
+                    // Separate request, so a cached message shows without waiting for the network.
+                    let id = s.id.clone();
+                    this.run(
+                        "",
+                        window,
+                        cx,
+                        move || client.modify(&id, &["UNREAD"]),
+                        move |this, r, _, _| match r {
+                            Ok(()) => {
+                                if let Some(x) = this.list.iter_mut().find(|x| x.id == s.id) {
+                                    x.unread = false;
+                                }
+                            }
+                            Err(_) => this.status = "Couldn't mark as read.".into(),
+                        },
+                    );
                 }
                 match &m.html {
                     #[cfg(target_os = "macos")]
@@ -253,6 +353,9 @@ impl MailApp {
     }
 
     fn select_and_open(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.keep_draft(cx) {
+            return;
+        }
         if ix < self.list.len() {
             self.select(ix, cx);
             self.open_selected(window, cx);
@@ -263,6 +366,9 @@ impl MailApp {
         let (Some(ix), Some(client)) = (self.selected, self.client()) else {
             return;
         };
+        if self.keep_draft(cx) {
+            return;
+        }
         let (summary, list_gen) = (self.list.remove(ix), self.list_gen);
         let id = summary.id.clone();
         self.archived.insert(id.clone());
@@ -295,34 +401,43 @@ impl MailApp {
     }
 
     fn start_compose(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(msg) = self.open.clone() else { return };
-        let to_value = match kind {
-            // Follow-up on my own sent mail goes to the original recipients.
-            Kind::Reply
-                if self
-                    .client()
-                    .is_some_and(|c| gmail::address(&msg.from).eq_ignore_ascii_case(&c.email)) =>
-            {
-                msg.to.clone()
-            }
-            Kind::Reply if !msg.reply_to.is_empty() => msg.reply_to.clone(),
-            Kind::Reply => msg.from.clone(),
-            Kind::Forward => String::new(),
+        if self.keep_draft(cx) {
+            return;
+        }
+        let msg = self.open.clone();
+        let to_value = match (kind, &msg) {
+            (Kind::New, _) => String::new(),
+            (_, None) => return,
+            (_, Some(msg)) => match kind {
+                // Follow-up on my own sent mail goes to the original recipients.
+                Kind::Reply
+                    if self.client().is_some_and(|c| {
+                        gmail::address(&msg.from).eq_ignore_ascii_case(&c.email)
+                    }) =>
+                {
+                    msg.to.clone()
+                }
+                Kind::Reply if !msg.reply_to.is_empty() => msg.reply_to.clone(),
+                Kind::Reply => msg.from.clone(),
+                _ => String::new(),
+            },
         };
         let to = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("To");
             s.set_value(to_value, window, cx);
             s
         });
+        let subject = cx.new(|cx| InputState::new(window, cx).placeholder("Subject"));
         let body = cx.new(|cx| TextareaState::new(window, cx).soft_wrap(true));
         match kind {
             Kind::Reply => body.update(cx, |b, cx| b.focus(window, cx)),
-            Kind::Forward => to.update(cx, |t, cx| t.focus(window, cx)),
+            _ => to.update(cx, |t, cx| t.focus(window, cx)),
         }
         self.compose = Some(Compose {
             kind,
-            msg,
+            msg: if kind == Kind::New { None } else { msg },
             to,
+            subject,
             body,
             sending: false,
         });
@@ -343,6 +458,7 @@ impl MailApp {
             return cx.notify();
         }
         let text = c.body.read(cx).value().to_string();
+        let subject = c.subject.read(cx).value().trim().to_string();
         let (kind, msg) = (c.kind, c.msg.clone());
         c.sending = true;
         let draft = c.body.entity_id();
@@ -350,14 +466,15 @@ impl MailApp {
             "Sending…",
             window,
             cx,
-            move || match kind {
-                Kind::Reply => client.send(
+            move || match (kind, msg) {
+                (Kind::Reply, Some(msg)) => client.send(
                     &gmail::reply_raw(&client.email, &to, &msg, &text),
                     Some(&msg.thread_id),
                 ),
-                Kind::Forward => {
+                (Kind::Forward, Some(msg)) => {
                     client.send(&gmail::forward_raw(&client.email, &to, &msg, &text), None)
                 }
+                _ => client.send(&gmail::new_raw(&client.email, &to, &subject, &text), None),
             },
             move |this, r, window, cx| {
                 // Only touch the composer that sent; another may have opened meanwhile.
@@ -399,28 +516,51 @@ impl MailApp {
             move || login.finish(&o),
             move |this, acct, window, cx| {
                 let Ok(acct) = acct else { return };
-                this.saved.retain(|a| a.email != acct.email);
-                this.clients.retain(|c| c.email != acct.email);
-                this.saved.push(acct.clone());
-                this.clients.push(Arc::new(Client::new(oauth, acct)));
+                // Replace in place: indexes (and `current`) must stay valid if the switch is refused.
+                let client = Arc::new(Client::new(oauth, acct.clone()));
+                let i = match this.saved.iter().position(|a| a.email == acct.email) {
+                    Some(i) => {
+                        this.saved[i] = acct;
+                        this.clients[i] = client;
+                        i
+                    }
+                    None => {
+                        this.saved.push(acct);
+                        this.clients.push(client);
+                        this.clients.len() - 1
+                    }
+                };
                 if let Err(e) = gmail::save_accounts(&this.saved) {
                     this.status = format!("Signed in, but saving failed: {e}").into();
                 }
-                let last = this.clients.len() - 1;
-                this.switch_account(last, window, cx);
+                this.switch_account(i, window, cx);
             },
         );
     }
 
     /// Clear everything bound to the old account before loading the new one.
     fn switch_account(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.keep_draft(cx) {
+            return;
+        }
         self.current = i;
-        self.list.clear();
         self.list_gen += 1;
         self.selected = None;
         self.open = None;
         self.compose = None;
-        self.refresh(window, cx);
+        self.history = None;
+        // Show the last known inbox at once (opening from the message cache), then update it.
+        // The cache only stands in for the inbox, not for an active search.
+        let inbox = self.search.read(cx).value().trim().is_empty();
+        self.list = self
+            .client()
+            .filter(|_| inbox)
+            .map(|c| gmail::cached_inbox(&c.email))
+            .unwrap_or_default();
+        self.list.retain(|x| !self.archived.contains(&x.id));
+        let cached = !self.list.is_empty();
+        self.select_and_open(0, window, cx);
+        self.refresh(cached, window, cx);
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -437,6 +577,7 @@ impl MailApp {
             "e" => self.archive(window, cx),
             "r" => self.start_compose(Kind::Reply, window, cx),
             "f" => self.start_compose(Kind::Forward, window, cx),
+            "c" => self.start_compose(Kind::New, window, cx),
             "/" => self.search.update(cx, |s, cx| s.focus(window, cx)),
             _ => return,
         }
@@ -499,8 +640,18 @@ impl MailApp {
         if let Some(web) = &self.web {
             // Step aside while the split is dragged, or the native view swallows the drag.
             web.set_visible(
-                !cx.has_active_drag() && self.open.as_ref().is_some_and(|m| m.html.is_some()),
+                !cx.has_active_drag()
+                    && !self.compose.as_ref().is_some_and(|c| c.kind == Kind::New)
+                    && self.open.as_ref().is_some_and(|m| m.html.is_some()),
             );
+        }
+        if let Some(c) = self.compose.as_ref().filter(|c| c.kind == Kind::New) {
+            // New mail takes the whole reader pane.
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_compose(c, cx))
+                .into_any_element();
         }
         let t = cx.theme();
         let Some(m) = self.open.clone() else {
@@ -510,7 +661,7 @@ impl MailApp {
                 .items_center()
                 .justify_center()
                 .text_color(t.muted_foreground)
-                .child("j/k move · e archive · r reply · f forward · / search")
+                .child("j/k move · e archive · r reply · f forward · c new · / search")
                 .into_any_element();
         };
         // Minimal fixed bar; From/To/Date live at the top of the scrolling content.
@@ -555,44 +706,7 @@ impl MailApp {
                     ),
             );
         if let Some(c) = &self.compose {
-            let title = if c.kind == Kind::Reply {
-                "Reply"
-            } else {
-                "Forward"
-            };
-            col = col.child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(t.border)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(Input::new(&c.to).disabled(c.sending))
-                    .child(Textarea::new(&c.body).h(px(180.)).disabled(c.sending))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("send")
-                                    .primary()
-                                    .small()
-                                    .loading(c.sending)
-                                    .label("Send")
-                                    .on_click(cx.listener(|this, _, w, cx| this.send(w, cx))),
-                            )
-                            .child(
-                                Button::new("cancel")
-                                    .ghost()
-                                    .small()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.compose = None;
-                                        this.focus.focus(w, cx);
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            );
+            col = col.child(self.render_compose(c, cx));
         }
         #[cfg(target_os = "macos")]
         if let (Some(web), true) = (self.web.clone(), m.html.is_some()) {
@@ -622,6 +736,54 @@ impl MailApp {
                 .child(content),
         )
         .into_any_element()
+    }
+}
+
+impl MailApp {
+    fn render_compose(&self, c: &Compose, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let t = cx.theme();
+        let title = match c.kind {
+            Kind::New => "New message",
+            Kind::Reply => "Reply",
+            Kind::Forward => "Forward",
+        };
+        let new = c.kind == Kind::New;
+        v_flex()
+            .p_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(t.border)
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(Input::new(&c.to).disabled(c.sending))
+            .when(new, |d| d.child(Input::new(&c.subject).disabled(c.sending)))
+            .child(
+                Textarea::new(&c.body)
+                    .h(px(if new { 320. } else { 180. }))
+                    .disabled(c.sending),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("send")
+                            .primary()
+                            .small()
+                            .loading(c.sending)
+                            .label("Send")
+                            .on_click(cx.listener(|this, _, w, cx| this.send(w, cx))),
+                    )
+                    .child(
+                        Button::new("cancel")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.compose = None;
+                                this.focus.focus(w, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 }
 
@@ -728,6 +890,9 @@ impl Render for MailApp {
                     .border_b_1()
                     .border_color(t.border)
                     .child(accounts)
+                    .child(Button::new("new").ghost().small().label("New").on_click(
+                        cx.listener(|this, _, w, cx| this.start_compose(Kind::New, w, cx)),
+                    ))
                     .child(
                         div()
                             .flex_1()
