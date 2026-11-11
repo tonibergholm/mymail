@@ -398,7 +398,12 @@ impl Client {
         inline_text_bodies(&mut m["payload"], &mut fetch)?;
         let mut msg = parse_message(&m);
         if let Some(h) = &msg.html {
-            msg.html = Some(resolve_cids(&m["payload"], h, &mut fetch)?);
+            msg.html = Some(resolve_cids(
+                &m["payload"],
+                h,
+                &mut fetch,
+                &mut CID_BUDGET.clone(),
+            )?);
         }
         Ok(msg)
     }
@@ -669,17 +674,27 @@ fn html_to_text(html: &str) -> String {
 
 /// Embedded images (`<img src="cid:...">`) live in sibling parts; inline the referenced ones
 /// as data: URIs so both readers can show them without network access.
+/// Total bytes of inlined images per message; one image referenced 1000x must not explode memory.
+const CID_BUDGET: usize = 25 << 20;
+
 fn resolve_cids(
     part: &Value,
     html: &str,
     fetch: &mut impl FnMut(&str) -> Result<Value>,
+    budget: &mut usize,
 ) -> Result<String> {
     let mut html = html.to_string();
     let mime = part["mimeType"].as_str().unwrap_or("");
     let cid = header(part, "Content-ID");
     let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
     let reference = format!("cid:{cid}");
-    if mime.starts_with("image/") && !cid.is_empty() && html.contains(&reference) {
+    // mime comes from the mail; only a plain token may be spliced into the HTML.
+    let safe_mime = mime.strip_prefix("image/").is_some_and(|t| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b))
+    });
+    if safe_mime && !cid.is_empty() && html.contains(&reference) {
         let data = match part["body"]["data"].as_str() {
             Some(d) => d.to_string(),
             None => match part["body"]["attachmentId"].as_str() {
@@ -696,10 +711,15 @@ fn resolve_cids(
                 c => c,
             })
             .collect();
-        html = html.replace(&reference, &format!("data:{mime};base64,{b64}"));
+        let uri = format!("data:{mime};base64,{b64}");
+        let cost = uri.len() * html.matches(&reference).count();
+        if cost <= *budget {
+            *budget -= cost;
+            html = html.replace(&reference, &uri);
+        }
     }
     for p in part["parts"].as_array().into_iter().flatten() {
-        html = resolve_cids(p, &html, fetch)?;
+        html = resolve_cids(p, &html, fetch, budget)?;
     }
     Ok(html)
 }
@@ -980,13 +1000,36 @@ mod tests {
              "body":{"attachmentId":"A9"}},
             {"mimeType":"image/gif","headers":[{"name":"Content-Id","value":"<unused@x>"}],"body":{"attachmentId":"NO"}}]});
         let mut asked = vec![];
-        let out = resolve_cids(&payload, r#"<img src="cid:logo@x">"#, &mut |att| {
-            asked.push(att.to_string());
-            Ok(json!("ab-_"))
-        })
+        let out = resolve_cids(
+            &payload,
+            r#"<img src="cid:logo@x">"#,
+            &mut |att| {
+                asked.push(att.to_string());
+                Ok(json!("ab-_"))
+            },
+            &mut CID_BUDGET.clone(),
+        )
         .unwrap();
         assert_eq!(out, r#"<img src="data:image/png;base64,ab+/">"#);
         assert_eq!(asked, ["A9"], "unreferenced images are not fetched");
+        // Over budget or a hostile mime type: left as cid: (shows as a broken image, nothing worse).
+        let hostile = json!({"mimeType":"image/png\" onerror=\"x","headers":[{"name":"Content-ID","value":"<a@x>"}],"body":{"data":"AAAA"}});
+        let html = r#"<img src="cid:a@x">"#;
+        assert_eq!(
+            resolve_cids(
+                &hostile,
+                html,
+                &mut |_| unreachable!(),
+                &mut CID_BUDGET.clone()
+            )
+            .unwrap(),
+            html
+        );
+        let big = json!({"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<a@x>"}],"body":{"data":"AAAA"}});
+        assert_eq!(
+            resolve_cids(&big, html, &mut |_| unreachable!(), &mut 10).unwrap(),
+            html
+        );
     }
 
     #[test]
