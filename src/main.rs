@@ -487,9 +487,11 @@ impl MailApp {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(m.subject.clone()),
                 )
-                .child(line("From", &m.from))
-                .child(line("To", &m.to))
-                .when(!m.cc.is_empty(), |d| d.child(line("Cc", &m.cc)))
+                .child(line("From", &gmail::decode_words(&m.from)))
+                .child(line("To", &gmail::decode_words(&m.to)))
+                .when(!m.cc.is_empty(), |d| {
+                    d.child(line("Cc", &gmail::decode_words(&m.cc)))
+                })
                 .child(line("Date", &m.date))
                 .child(
                     h_flex()

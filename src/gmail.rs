@@ -418,6 +418,77 @@ impl Client {
     }
 }
 
+/// Decode RFC 2047 encoded words (`=?UTF-8?B?...?=`); Gmail returns header values raw.
+/// From/To/Cc stay raw in `Message` so they remain valid as reply recipients.
+pub fn decode_words(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    let mut prev_word = false;
+    while let Some(start) = rest.find("=?") {
+        let (before, tail) = rest.split_at(start);
+        let word = (|| {
+            let mut it = tail[2..].splitn(3, '?');
+            let (cs, enc, more) = (it.next()?, it.next()?, it.next()?);
+            let text = &more[..more.find("?=")?];
+            let bytes = match enc {
+                "B" | "b" => STANDARD.decode(text).ok()?,
+                "Q" | "q" => q_decode(text),
+                _ => return None,
+            };
+            let label = cs.split('*').next()?; // drop RFC 2231 language tag
+            let encoding = encoding_rs::Encoding::for_label(label.as_bytes())?;
+            Some((
+                encoding.decode(&bytes).0.into_owned(),
+                2 + cs.len() + 1 + enc.len() + 1 + text.len() + 2,
+            ))
+        })();
+        match word {
+            Some((decoded, len)) => {
+                // Whitespace between adjacent encoded words is not part of the text.
+                if !(prev_word && before.trim().is_empty()) {
+                    out += before;
+                }
+                out += &decoded;
+                rest = &tail[len..];
+                prev_word = true;
+            }
+            None => {
+                out += before;
+                out += "=?";
+                rest = &tail[2..];
+                prev_word = false;
+            }
+        }
+    }
+    out + rest
+}
+
+fn q_decode(text: &str) -> Vec<u8> {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'_' => out.push(b' '),
+            b'=' if i + 2 < b.len() => {
+                match std::str::from_utf8(&b[i + 1..i + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    Some(v) => {
+                        out.push(v);
+                        i += 2;
+                    }
+                    None => out.push(b'='),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
 fn header(payload: &Value, name: &str) -> String {
     payload["headers"]
         .as_array()
@@ -437,8 +508,8 @@ fn summary(m: &Value) -> Summary {
     let p = &m["payload"];
     Summary {
         id: m["id"].as_str().unwrap_or("").into(),
-        from: display_name(&header(p, "From")),
-        subject: header(p, "Subject"),
+        from: display_name(&decode_words(&header(p, "From"))),
+        subject: decode_words(&header(p, "Subject")),
         date: header(p, "Date"),
         snippet: unescape_html(m["snippet"].as_str().unwrap_or("")),
         unread: m["labelIds"]
@@ -484,7 +555,7 @@ pub fn parse_message(m: &Value) -> Message {
         reply_to: header(p, "Reply-To"),
         to: header(p, "To"),
         cc: header(p, "Cc"),
-        subject: header(p, "Subject"),
+        subject: decode_words(&header(p, "Subject")),
         date: header(p, "Date"),
         message_id: header(p, "Message-ID"),
         references: header(p, "References"),
@@ -568,7 +639,7 @@ fn encode_word(s: &str) -> String {
 
 fn quote(msg: &Message) -> String {
     let q: String = msg.body.lines().map(|l| format!("> {l}\n")).collect();
-    format!("\nOn {}, {} wrote:\n{q}", msg.date, msg.from)
+    format!("\nOn {}, {} wrote:\n{q}", msg.date, decode_words(&msg.from))
 }
 
 pub fn prefixed(prefix: &str, subject: &str) -> String {
@@ -619,7 +690,11 @@ pub fn reply_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
 pub fn forward_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
     let fwd = format!(
         "{text}\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}",
-        msg.from, msg.date, msg.subject, msg.to, msg.body
+        decode_words(&msg.from),
+        msg.date,
+        msg.subject,
+        decode_words(&msg.to),
+        msg.body
     );
     build(me, to, &prefixed("Fwd:", &msg.subject), &[], &fwd)
 }
@@ -744,6 +819,20 @@ mod tests {
             "headers":[{"name":"Content-Type","value":"text/plain; Charset = \"ISO-8859-1\""}],
             "body":{"data":URL_SAFE.encode(b"Hyv\xe4\xe4 p\xe4iv\xe4\xe4")}}});
         assert_eq!(parse_message(&m).body, "Hyvää päivää");
+    }
+
+    #[test]
+    fn decodes_encoded_words() {
+        assert_eq!(
+            decode_words("=?UTF-8?B?SHl2w6TDpCBww6RpdsOkw6Q=?="),
+            "Hyvää päivää"
+        );
+        assert_eq!(
+            decode_words("=?iso-8859-1?Q?J=E4ne_D?= <j@x.com>"),
+            "Jäne D <j@x.com>"
+        );
+        assert_eq!(decode_words("=?UTF-8?Q?a?= =?UTF-8?Q?b?= c"), "ab c");
+        assert_eq!(decode_words("plain =? not encoded"), "plain =? not encoded");
     }
 
     #[test]
