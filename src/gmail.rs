@@ -427,7 +427,11 @@ fn find_attachments(part: &Value, html: &str, out: &mut Vec<Attachment>) {
         let cid = header(part, "Content-ID");
         let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
         // An image the HTML already shows inline isn't listed again.
-        if cid.is_empty() || !html.contains(&format!("cid:{cid}")) {
+        let mime = part["mimeType"].as_str().unwrap_or("");
+        let inline = mime.starts_with("image/")
+            && !cid.is_empty()
+            && !cid_hits(html, &format!("cid:{cid}")).is_empty();
+        if !inline {
             out.push(Attachment {
                 name: strip_tricks(&decode_words(name)),
                 mime: part["mimeType"].as_str().unwrap_or("").into(),
@@ -1044,17 +1048,7 @@ fn resolve_cids(
             && t.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b))
     });
-    // Whole references only: "cid:image1" must not match the start of "cid:image10".
-    let hits: Vec<usize> = html
-        .match_indices(&reference)
-        .map(|(i, _)| i)
-        .filter(|&i| {
-            html[i + reference.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| c == '"' || c == '\'' || c == ')' || c.is_whitespace())
-        })
-        .collect();
+    let hits = cid_hits(&html, &reference);
     if safe_mime && !cid.is_empty() && !hits.is_empty() {
         let data = match part["body"]["data"].as_str().filter(|d| !d.is_empty()) {
             Some(d) => d.to_string(),
@@ -1085,6 +1079,19 @@ fn resolve_cids(
         html = resolve_cids(p, &html, fetch, budget)?;
     }
     Ok(html)
+}
+
+/// Whole references only: "cid:image1" must not match the start of "cid:image10".
+fn cid_hits(html: &str, reference: &str) -> Vec<usize> {
+    html.match_indices(reference)
+        .map(|(i, _)| i)
+        .filter(|&i| {
+            html[i + reference.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == '"' || c == '\'' || c == ')' || c.is_whitespace())
+        })
+        .collect()
 }
 
 fn find_bodies(part: &Value, plain: &mut Option<String>, html: &mut Option<String>) {
@@ -1561,16 +1568,20 @@ mod tests {
     #[test]
     fn lists_files_but_not_inline_images() {
         let m = json!({"payload": {"mimeType": "multipart/mixed", "parts": [
-            {"partId": "0", "mimeType": "text/html", "body": {"data": URL_SAFE.encode("<img src=\"cid:logo\">hi")}},
+            {"partId": "0", "mimeType": "text/html", "body": {"data": URL_SAFE.encode("<img src=\"cid:logo\"><img src=\"cid:logo10\">hi")}},
             {"partId": "1", "mimeType": "image/png", "filename": "logo.png",
              "headers": [{"name": "Content-ID", "value": "<logo>"}], "body": {"size": 10}},
+            {"partId": "3", "mimeType": "image/png", "filename": "logo1.png",
+             "headers": [{"name": "Content-ID", "value": "<logo1>"}], "body": {"size": 10}},
             {"partId": "2", "mimeType": "application/pdf", "filename": "=?UTF-8?Q?r=C3=A4portti.pdf?=",
              "body": {"size": 2048, "attachmentId": "A"}}
         ]}});
         let a = parse_message(&m).attachments;
-        assert_eq!(a.len(), 1);
+        // logo is shown inline; logo1 only prefixes the cid:logo10 reference, so it's listed.
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].name, "logo1.png");
         assert_eq!(
-            (a[0].name.as_str(), a[0].part.as_str(), a[0].size),
+            (a[1].name.as_str(), a[1].part.as_str(), a[1].size),
             ("räportti.pdf", "2", 2048)
         );
         assert_eq!(

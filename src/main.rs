@@ -550,7 +550,15 @@ impl MailApp {
                 let mut total = 0;
                 for (name, path, original) in picked {
                     let data = match (path, &original, &msg) {
-                        (Some(p), _, _) => std::fs::read(&p).map_err(|e| format!("{name}: {e}"))?,
+                        (Some(p), _, _) => {
+                            // Bounded read: a file that grew since the size check can't blow memory.
+                            use std::io::Read;
+                            let mut data = vec![];
+                            std::fs::File::open(&p)
+                                .and_then(|f| f.take(MAX_ATTACH - total + 1).read_to_end(&mut data))
+                                .map_err(|e| format!("{name}: {e}"))?;
+                            data
+                        }
                         (_, Some(a), Some(m)) => client.attachment(&m.id, &a.part)?,
                         _ => continue,
                     };
