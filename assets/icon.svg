@@ -1,4 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#dc2626"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">M</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f43f5e"/>
+      <stop offset="1" stop-color="#b91c1c"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fde8e8"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS icon grid: 824px body inset 100px, continuous-corner radius ~185 -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <g transform="translate(17 0)">
+  <!-- speed lines -->
+  <g stroke="#ffffff" stroke-linecap="round" stroke-opacity="0.85" stroke-width="34">
+    <line x1="190" y1="430" x2="290" y2="430"/>
+    <line x1="160" y1="512" x2="290" y2="512"/>
+    <line x1="210" y1="594" x2="290" y2="594"/>
+  </g>
+  <!-- envelope -->
+  <rect x="330" y="350" width="500" height="330" rx="44" fill="url(#paper)"/>
+  <path d="M352 380 L580 548 Q580 548 580 548 L808 380" fill="none" stroke="#b91c1c" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
 </svg>
