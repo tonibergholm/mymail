@@ -55,6 +55,10 @@ struct MailApp {
     archived: std::collections::HashSet<String>,
     /// Mailbox historyId at the last inbox load; polling refreshes when it moves.
     history: Option<String>,
+    /// A background check is in flight; the timer skips ticks until it ends.
+    polling: bool,
+    /// Error shown by a background run; the next successful one clears it.
+    quiet_err: Option<SharedString>,
     _subs: Vec<Subscription>,
 }
 
@@ -115,6 +119,8 @@ impl MailApp {
             list_gen: 0,
             archived: Default::default(),
             history: None,
+            polling: false,
+            quiet_err: None,
             _subs: subs,
         };
         if app.clients.is_empty() && app.oauth.is_some() {
@@ -133,7 +139,7 @@ impl MailApp {
                         .await;
                     let alive = this.update_in(cx, |this, window, cx| {
                         // Only the inbox view auto-updates; a search result stays put.
-                        if this.search.read(cx).value().trim().is_empty() {
+                        if !this.polling && this.search.read(cx).value().trim().is_empty() {
                             this.refresh(true, window, cx);
                         }
                     });
@@ -184,6 +190,7 @@ impl MailApp {
         let quiet = label.is_empty();
         if !quiet {
             self.status = label.to_string().into();
+            self.quiet_err = None; // the status now belongs to this action
             cx.notify();
         }
         let task = cx.background_spawn(async move { job() });
@@ -191,9 +198,18 @@ impl MailApp {
             let result = task.await;
             this.update_in(cx, |this, window, cx| {
                 match &result {
-                    Ok(_) if quiet => {}
+                    Ok(_) if quiet => {
+                        if this.quiet_err.take().is_some_and(|e| e == this.status) {
+                            this.status = SharedString::default();
+                        }
+                    }
                     Ok(_) => this.status = SharedString::default(),
-                    Err(e) => this.status = e.clone().into(),
+                    Err(e) => {
+                        this.status = e.clone().into();
+                        if quiet {
+                            this.quiet_err = Some(this.status.clone());
+                        }
+                    }
                 }
                 done(this, result, window, cx);
                 cx.notify();
@@ -214,6 +230,7 @@ impl MailApp {
             q
         };
         let inbox = q == "in:inbox";
+        self.polling |= quiet;
         let last = self.history.clone().filter(|_| quiet && inbox);
         let (account, query) = (client.clone(), q.clone());
         self.run(
@@ -238,6 +255,9 @@ impl MailApp {
                 Ok(Some((h.filter(|_| complete), list)))
             },
             move |this, r, window, cx| {
+                if quiet {
+                    this.polling = false;
+                }
                 let Ok(Some((h, list))) = r else { return };
                 // Drop stale results if the user switched account or query meanwhile.
                 let now = this.search.read(cx).value().trim().to_string();
@@ -588,6 +608,7 @@ impl MailApp {
         let t = cx.theme();
         let s = &self.list[ix];
         let selected = self.selected == Some(ix);
+        let read = t.foreground.opacity(0.6);
         v_flex()
             .id(ix)
             .w_full()
@@ -602,24 +623,35 @@ impl MailApp {
             .child(
                 h_flex()
                     .gap_2()
+                    .items_center()
+                    // Unread: blue dot and bold; read: dimmed, so the two differ in dark mode too.
+                    .child(
+                        div()
+                            .size(px(7.))
+                            .flex_none()
+                            .rounded_full()
+                            .when(s.unread, |d| d.bg(t.blue)),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .truncate()
                             .when(s.unread, |d| d.font_weight(FontWeight::BOLD))
+                            .when(!s.unread, |d| d.text_color(read))
                             .child(s.from.clone()),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(t.muted_foreground)
-                            .child(short_date(&s.date)),
+                            .child(list_time(s.time, &s.date)),
                     ),
             )
             .child(
                 div()
                     .truncate()
                     .when(s.unread, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .when(!s.unread, |d| d.text_color(read))
                     .child(s.subject.clone()),
             )
             .child(
@@ -796,7 +828,13 @@ fn details(m: &Message) -> Vec<(&'static str, String)> {
     if !m.cc.is_empty() {
         v.push(("Cc", gmail::decode_words(&m.cc)));
     }
-    v.push(("Date", m.date.clone()));
+    v.push((
+        "Date",
+        local(m.time).map_or_else(
+            || m.date.clone(),
+            |t| t.format("%a %-d %b %Y %H:%M").to_string(),
+        ),
+    ));
     v
 }
 
@@ -829,10 +867,39 @@ fn details_html(m: &Message) -> String {
     )
 }
 
-/// "Tue, 4 Nov 2026 10:22:01 +0200" -> "4 Nov"
-fn short_date(d: &str) -> String {
-    let d = d.split_once(", ").map_or(d, |x| x.1);
-    d.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+fn local(ms: i64) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    (ms > 0)
+        .then(|| chrono::Local.timestamp_millis_opt(ms).single())
+        .flatten()
+}
+
+/// Local time: "14:05" today, "4 Nov" this year, "4 Nov 2025" before.
+fn list_time(ms: i64, header: &str) -> String {
+    let Some(t) = local(ms) else {
+        // No internalDate from Gmail: "Tue, 4 Nov 2026 10:22:01 +0200" -> "4 Nov"
+        let d = header.split_once(", ").map_or(header, |x| x.1);
+        return d.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    };
+    format_list_time(t, chrono::Local::now())
+}
+
+fn format_list_time<Tz: chrono::TimeZone>(
+    t: chrono::DateTime<Tz>,
+    now: chrono::DateTime<Tz>,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use chrono::Datelike;
+    let fmt = if t.date_naive() == now.date_naive() {
+        "%H:%M"
+    } else if t.year() == now.year() {
+        "%-d %b"
+    } else {
+        "%-d %b %Y"
+    };
+    t.format(fmt).to_string()
 }
 
 impl Render for MailApp {
@@ -980,4 +1047,25 @@ fn main() {
             .expect("open window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{FixedOffset, TimeZone};
+
+    #[test]
+    fn list_time_is_relative_to_today() {
+        let tz = FixedOffset::east_opt(2 * 3600).unwrap();
+        let now = tz.with_ymd_and_hms(2026, 11, 11, 18, 0, 0).unwrap();
+        let at = |y, mo, d, h, mi| tz.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+        assert_eq!(
+            super::format_list_time(at(2026, 11, 11, 9, 5), now),
+            "09:05"
+        );
+        assert_eq!(super::format_list_time(at(2026, 11, 4, 9, 5), now), "4 Nov");
+        assert_eq!(
+            super::format_list_time(at(2025, 12, 31, 9, 5), now),
+            "31 Dec 2025"
+        );
+    }
 }
