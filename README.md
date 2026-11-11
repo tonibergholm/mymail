@@ -5,8 +5,12 @@
 A small, fast Gmail client for macOS and Linux (Omarchy / Wayland), written in
 Rust with [GPUI](https://gpui.rs) and [GPUI Kit](https://gpui-kit.com).
 
-It does five things: search, read, reply, forward, archive. It works with
+It does six things: search, read, write, reply, forward, archive. It works with
 Gmail and Google Workspace accounts, and you can sign in to several.
+
+The inbox checks for new mail every 60 seconds; a check that finds nothing new
+costs one small request. Messages you have opened are cached on disk, so they
+reopen instantly and the last inbox shows right away at startup.
 
 ## Keys
 
@@ -16,6 +20,7 @@ Gmail and Google Workspace accounts, and you can sign in to several.
 | `e` | Archive |
 | `r` | Reply |
 | `f` | Forward |
+| `c` | New message |
 | `/` | Search (Gmail syntax, e.g. `from:alice is:unread`) |
 
 An empty search shows the inbox.
@@ -40,11 +45,25 @@ Gmail needs an OAuth client of your own:
 
    Or set `MYMAIL_CLIENT_ID` and `MYMAIL_CLIENT_SECRET`.
 
-5. Run the app and click **+ Account**. Sign in from the browser window that
+5. Run the app and choose **Add account…** from the account menu. Sign in from the browser window that
    opens. Repeat for each account.
 
 The app requests one scope, `gmail.modify` (read, label, send). Refresh tokens
 are stored in `accounts.json` in the same directory, with mode 0600.
+
+## Settings
+
+Optional `settings.json` in the same directory:
+
+```json
+{ "poll_secs": 60 }
+```
+
+`poll_secs` is how often the inbox checks for new mail; `0` turns it off.
+
+Cached mail lives in `~/Library/Caches/mymail` (macOS) or `~/.cache/mymail`
+(Linux), readable only by you. Entries older than 30 days are removed at
+startup. Delete the folder to clear it.
 
 ## Install
 

@@ -78,22 +78,99 @@ pub fn load_accounts() -> Vec<SavedAccount> {
 
 // shortcut: refresh tokens live in a 0600 file, not the OS keychain; move to keyring if the machine is shared.
 pub fn save_accounts(accounts: &[SavedAccount]) -> Result<()> {
-    std::fs::create_dir_all(dir()).map_err(err)?;
-    let path = dir().join("accounts.json");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(&path).map_err(err)?;
-    #[cfg(unix)]
-    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .map_err(err)?;
-    f.write_all(
+    write_private(
+        &dir().join("accounts.json"),
         serde_json::to_string_pretty(accounts)
             .map_err(err)?
             .as_bytes(),
     )
-    .map_err(err)
+}
+
+/// `settings.json` in the config dir: `{"poll_secs": 60}`; 0 turns checking off.
+pub fn poll_secs() -> u64 {
+    std::fs::read(dir().join("settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["poll_secs"].as_u64())
+        .unwrap_or(60)
+}
+
+/// Owner-only file (and 0700 parent dirs): tokens and cached mail.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dirs, 0o700);
+    dirs.create(path.parent().ok_or("bad path")?).map_err(err)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path).map_err(err)?;
+    #[cfg(unix)]
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(err)?;
+    f.write_all(bytes).map_err(err)
+}
+
+// ---------- local cache ----------
+// Gmail message content never changes (only labels do), so a fetched message is cached for good.
+
+/// Bump the version when `Message`/`Summary` or parsing changes, so old entries are ignored.
+fn cache_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| ".".into())
+        .join("mymail")
+        .join("v1")
+}
+
+/// None for anything that isn't a safe file name (ids come from the network).
+fn cache_file(email: &str, name: &str) -> Option<PathBuf> {
+    let safe = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
+    };
+    (safe(email) && safe(name)).then(|| cache_root().join(email).join(format!("{name}.json")))
+}
+
+fn cache_read<T: serde::de::DeserializeOwned>(email: &str, name: &str) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(cache_file(email, name)?).ok()?).ok()
+}
+
+fn cache_write<T: Serialize>(email: &str, name: &str, value: &T) {
+    if let (Some(path), Ok(bytes)) = (cache_file(email, name), serde_json::to_vec(value)) {
+        let _ = write_private(&path, &bytes);
+    }
+}
+
+/// The last inbox listing, shown at startup before the network answers.
+pub fn cached_inbox(email: &str) -> Vec<Summary> {
+    cache_read(email, "inbox").unwrap_or_default()
+}
+
+pub fn save_inbox(email: &str, list: &[Summary]) {
+    cache_write(email, "inbox", &list);
+}
+
+// shortcut: drops cached messages fetched over 30 days ago; switch to a size cap if the cache grows too big.
+pub fn prune_cache() {
+    let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86400);
+    let Ok(accounts) = std::fs::read_dir(cache_root()) else {
+        return;
+    };
+    for f in accounts
+        .flatten()
+        .flat_map(|a| std::fs::read_dir(a.path()).into_iter().flatten().flatten())
+    {
+        if f.metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < old)
+        {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
 }
 
 // ---------- OAuth ----------
@@ -252,7 +329,7 @@ fn dec(s: &str) -> String {
 
 // ---------- API client ----------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Summary {
     pub id: String,
     pub from: String,
@@ -262,7 +339,7 @@ pub struct Summary {
     pub unread: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub thread_id: String,
@@ -391,7 +468,25 @@ impl Client {
         }
     }
 
+    /// Changes whenever anything in the mailbox does; a cheap "is there news?" check.
+    pub fn history_id(&self) -> Result<String> {
+        let p = self.get("/profile")?;
+        p["historyId"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| "no historyId".into())
+    }
+
     pub fn message(&self, id: &str) -> Result<Message> {
+        if let Some(m) = cache_read(&self.email, id) {
+            return Ok(m);
+        }
+        let msg = self.fetch_message(id)?;
+        cache_write(&self.email, id, &msg);
+        Ok(msg)
+    }
+
+    fn fetch_message(&self, id: &str) -> Result<Message> {
         let mut m = self.get(&format!("/messages/{id}?format=full"))?;
         let mut fetch =
             |att: &str| Ok(self.get(&format!("/messages/{id}/attachments/{att}"))?["data"].clone());
@@ -827,6 +922,10 @@ pub fn reply_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
     )
 }
 
+pub fn new_raw(me: &str, to: &str, subject: &str, text: &str) -> String {
+    build(me, to, subject, &[], text)
+}
+
 pub fn forward_raw(me: &str, to: &str, msg: &Message, text: &str) -> String {
     let fwd = format!(
         "{text}\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}",
@@ -1068,5 +1167,29 @@ mod tests {
         assert_eq!(display_name("<j@x.com>"), "j@x.com");
         assert_eq!(address("\"Jane\" <J@x.com>"), "J@x.com");
         assert_eq!(address("j@x.com"), "j@x.com");
+    }
+
+    #[test]
+    fn cache_paths_stay_inside_the_cache() {
+        assert!(cache_file("me@x.com", "18c2f0a1b2").is_some());
+        for bad in ["", "..", "../x", "a/b", ".hidden", "a\\b"] {
+            assert!(cache_file("me@x.com", bad).is_none(), "{bad}");
+            assert!(cache_file(bad, "18c2f0a1b2").is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cached_message_round_trips() {
+        let m = sample();
+        let back: Message = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!((back.id, back.body, back.html), (m.id, m.body, m.html));
+    }
+
+    #[test]
+    fn new_mail_has_subject_and_no_thread_headers() {
+        let raw = new_raw("me@x.com", "a@y.com", "Hi\r\nBcc: evil@z", "body");
+        assert!(raw.contains("Subject: Hi  Bcc: evil@z\r\n"));
+        assert!(!raw.contains("In-Reply-To"));
+        assert_eq!(decode_body(&raw), "body");
     }
 }
