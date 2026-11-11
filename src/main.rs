@@ -150,9 +150,21 @@ impl MailApp {
     /// Typed text in an open composer that navigating away would throw away.
     fn draft_dirty(&self, cx: &App) -> bool {
         self.compose.as_ref().is_some_and(|c| {
+            let typed = |s: &Entity<InputState>| !s.read(cx).value().trim().is_empty();
             !c.body.read(cx).value().trim().is_empty()
-                || (c.kind == Kind::New && !c.subject.read(cx).value().trim().is_empty())
+                || (c.kind == Kind::New && typed(&c.subject))
+                || (c.kind != Kind::Reply && typed(&c.to))
         })
+    }
+
+    /// Refuse an action that would discard a typed draft.
+    fn keep_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let dirty = self.draft_dirty(cx);
+        if dirty {
+            self.status = "Send or cancel the draft first.".into();
+            cx.notify();
+        }
+        dirty
     }
 
     fn client(&self) -> Option<Arc<Client>> {
@@ -253,10 +265,8 @@ impl MailApp {
                 if quiet || draft_of.is_some() {
                     // Don't throw away a draft or yank the reader; just re-point the selection.
                     let id = draft_of.flatten().or(keep);
+                    // Never auto-open here: opening marks the message read.
                     this.selected = id.and_then(|id| this.list.iter().position(|x| x.id == id));
-                    if this.selected.is_none() && this.compose.is_none() {
-                        this.select_and_open(0, window, cx);
-                    }
                     return;
                 }
                 this.selected = None;
@@ -280,9 +290,8 @@ impl MailApp {
         let (Some(ix), Some(client)) = (self.selected, self.client()) else {
             return;
         };
-        if self.draft_dirty(cx) {
-            self.status = "Send or cancel the draft first.".into();
-            return cx.notify();
+        if self.keep_draft(cx) {
+            return;
         }
         let s = self.list[ix].clone();
         self.compose = None;
@@ -330,9 +339,8 @@ impl MailApp {
     }
 
     fn select_and_open(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft_dirty(cx) {
-            self.status = "Send or cancel the draft first.".into();
-            return cx.notify();
+        if self.keep_draft(cx) {
+            return;
         }
         if ix < self.list.len() {
             self.select(ix, cx);
@@ -344,6 +352,9 @@ impl MailApp {
         let (Some(ix), Some(client)) = (self.selected, self.client()) else {
             return;
         };
+        if self.keep_draft(cx) {
+            return;
+        }
         let (summary, list_gen) = (self.list.remove(ix), self.list_gen);
         let id = summary.id.clone();
         self.archived.insert(id.clone());
@@ -376,9 +387,8 @@ impl MailApp {
     }
 
     fn start_compose(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft_dirty(cx) {
-            self.status = "Send or cancel the draft first.".into();
-            return cx.notify();
+        if self.keep_draft(cx) {
+            return;
         }
         let msg = self.open.clone();
         let to_value = match (kind, &msg) {
@@ -507,6 +517,9 @@ impl MailApp {
 
     /// Clear everything bound to the old account before loading the new one.
     fn switch_account(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.keep_draft(cx) {
+            return;
+        }
         self.current = i;
         self.list_gen += 1;
         self.selected = None;

@@ -117,11 +117,8 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 // Gmail message content never changes (only labels do), so a fetched message is cached for good.
 
 /// Bump the version when `Message`/`Summary` or parsing changes, so old entries are ignored.
-fn cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| ".".into())
-        .join("mymail")
-        .join("v1")
+fn cache_root() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("mymail").join("v1"))
 }
 
 /// None for anything that isn't a safe file name (ids come from the network).
@@ -132,7 +129,9 @@ fn cache_file(email: &str, name: &str) -> Option<PathBuf> {
             && s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
     };
-    (safe(email) && safe(name)).then(|| cache_root().join(email).join(format!("{name}.json")))
+    (safe(email) && safe(name))
+        .then(|| Some(cache_root()?.join(email).join(format!("{name}.json"))))
+        .flatten()
 }
 
 fn cache_read<T: serde::de::DeserializeOwned>(email: &str, name: &str) -> Option<T> {
@@ -157,7 +156,7 @@ pub fn save_inbox(email: &str, list: &[Summary]) {
 // shortcut: drops cached messages fetched over 30 days ago; switch to a size cap if the cache grows too big.
 pub fn prune_cache() {
     let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86400);
-    let Ok(accounts) = std::fs::read_dir(cache_root()) else {
+    let Some(Ok(accounts)) = cache_root().map(std::fs::read_dir) else {
         return;
     };
     for f in accounts
