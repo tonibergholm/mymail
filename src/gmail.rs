@@ -606,6 +606,33 @@ fn decode_charset(content_type: &str, bytes: &[u8]) -> String {
     enc.decode(bytes).0.into_owned()
 }
 
+/// Remove invisible preheader padding. ZWJ/ZWNJ are kept between visible characters,
+/// where emoji sequences and Persian/Indic text need them.
+fn strip_padding(line: &str) -> String {
+    const PAD: &str = "\u{34f}\u{200b}\u{2800}\u{ad}\u{feff}";
+    let invisible = |c: Option<&char>| {
+        c.is_none_or(|c| {
+            c.is_whitespace() || PAD.contains(*c) || matches!(c, '\u{200c}' | '\u{200d}')
+        })
+    };
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    for (i, c) in chars.iter().enumerate() {
+        let joiner = matches!(c, '\u{200c}' | '\u{200d}');
+        let keep = if PAD.contains(*c) {
+            false
+        } else if joiner {
+            !invisible(i.checked_sub(1).and_then(|p| chars.get(p))) && !invisible(chars.get(i + 1))
+        } else {
+            true
+        };
+        if keep {
+            out.push(*c);
+        }
+    }
+    out
+}
+
 /// Readable plain text: no markup, link footnotes or table borders; lines wrap in the reader.
 fn html_to_text(html: &str) -> String {
     let text = html2text::config::with_decorator(html2text::render::TrivialDecorator::new())
@@ -617,10 +644,7 @@ fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut blank = 0;
     for line in text.lines() {
-        let line: String = line
-            .chars()
-            .filter(|c| !"\u{34f}\u{200b}\u{200c}\u{200d}\u{2800}\u{ad}\u{feff}".contains(*c))
-            .collect();
+        let line = strip_padding(line);
         let line = line.trim_end();
         if line.trim().is_empty() {
             blank += 1;
@@ -888,6 +912,20 @@ mod tests {
         );
         assert_eq!(decode_words("=?UTF-8?Q?a?= =?UTF-8?Q?b?= c"), "ab c");
         assert_eq!(decode_words("plain =? not encoded"), "plain =? not encoded");
+    }
+
+    #[test]
+    fn padding_strip_keeps_joiners() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        assert_eq!(
+            strip_padding(&format!("Hi {family}")),
+            format!("Hi {family}")
+        );
+        assert_eq!(strip_padding("می\u{200c}خواهم"), "می\u{200c}خواهم");
+        assert_eq!(
+            strip_padding("Deal \u{34f}\u{2800}\u{200c} \u{34f}\u{2800}\u{200c}").trim_end(),
+            "Deal"
+        );
     }
 
     #[test]
