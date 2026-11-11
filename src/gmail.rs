@@ -65,10 +65,15 @@ pub fn load_client() -> Result<OAuthClient> {
 }
 
 pub fn load_accounts() -> Vec<SavedAccount> {
-    std::fs::read_to_string(dir().join("accounts.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let path = dir().join("accounts.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    serde_json::from_str(&text).unwrap_or_else(|_| {
+        // Keep the unreadable file instead of overwriting its tokens on the next save.
+        let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+        vec![]
+    })
 }
 
 // shortcut: refresh tokens live in a 0600 file, not the OS keychain; move to keyring if the machine is shared.
@@ -80,6 +85,9 @@ pub fn save_accounts(accounts: &[SavedAccount]) -> Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&path).map_err(err)?;
+    #[cfg(unix)]
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(err)?;
     f.write_all(
         serde_json::to_string_pretty(accounts)
             .map_err(err)?
@@ -133,9 +141,15 @@ impl Login {
 
     /// Blocks until the browser redirects back, then exchanges the code.
     pub fn finish(self, client: &OAuthClient) -> Result<SavedAccount> {
-        let (mut stream, _) = self.listener.accept().map_err(err)?;
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line).map_err(err)?;
+        // Browsers may open empty preconnect sockets or ask for /favicon.ico; wait for the redirect.
+        let (mut stream, line) = loop {
+            let (stream, _) = self.listener.accept().map_err(err)?;
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_ok() && line.contains("state=") {
+                break (stream, line);
+            }
+        };
         let query = line
             .split_whitespace()
             .nth(1)
@@ -367,7 +381,12 @@ impl Client {
                 .flat_map(|h| h.join().unwrap())
                 .collect()
         });
-        results.into_iter().collect()
+        // Keep what loaded; one throttled message shouldn't blank the inbox.
+        let (ok, errs): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| r.is_ok());
+        match (ok.is_empty(), errs.into_iter().next()) {
+            (true, Some(Err(e))) => Err(e),
+            _ => Ok(ok.into_iter().map(Result::unwrap).collect()),
+        }
     }
 
     pub fn message(&self, id: &str) -> Result<Message> {
@@ -669,6 +688,33 @@ mod tests {
         .unwrap();
         assert_eq!(asked, ["A1", "A3"]);
         assert_eq!(parse_message(&m).body, "big body");
+    }
+
+    #[test]
+    fn login_skips_preconnects_and_checks_state() {
+        let client = OAuthClient {
+            client_id: "id".into(),
+            client_secret: "s".into(),
+        };
+        let login = Login::start(&client).unwrap();
+        let addr = login.listener.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            drop(std::net::TcpStream::connect(addr).unwrap()); // empty preconnect
+            let mut fav = std::net::TcpStream::connect(addr).unwrap();
+            fav.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").unwrap();
+            drop(fav);
+            let mut cb = std::net::TcpStream::connect(addr).unwrap();
+            cb.write_all(b"GET /?state=forged&code=x HTTP/1.1\r\n\r\n")
+                .unwrap();
+            let mut resp = String::new();
+            let _ = std::io::Read::read_to_string(&mut cb, &mut resp);
+            resp
+        });
+        assert_eq!(
+            login.finish(&client).err().as_deref(),
+            Some("OAuth state mismatch")
+        );
+        assert!(t.join().unwrap().contains("Sign-in failed"));
     }
 
     #[test]

@@ -365,6 +365,10 @@ impl MailApp {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        if m.platform || m.control || m.alt {
+            return; // leave Cmd+F, Ctrl+E etc. to the system
+        }
         let next = self.selected.map_or(0, |i| i + 1);
         let prev = self.selected.map_or(0, |i| i.saturating_sub(1));
         match ev.keystroke.key.as_str() {
