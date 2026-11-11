@@ -190,6 +190,7 @@ impl MailApp {
         let quiet = label.is_empty();
         if !quiet {
             self.status = label.to_string().into();
+            self.quiet_err = None; // the status now belongs to this action
             cx.notify();
         }
         let task = cx.background_spawn(async move { job() });
