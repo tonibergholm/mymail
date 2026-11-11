@@ -427,7 +427,8 @@ impl Client {
 
     /// Gmail search syntax, newest first. Metadata is fetched in parallel.
     // shortcut: first 50 results only, no paging; add nextPageToken if searches need more.
-    pub fn list(&self, query: &str) -> Result<Vec<Summary>> {
+    /// Also says whether every message loaded (false = some metadata requests failed).
+    pub fn list(&self, query: &str) -> Result<(Vec<Summary>, bool)> {
         let ids: Vec<String> =
             self.get(&format!("/messages?maxResults=50&q={}", enc(query)))?["messages"]
                 .as_array()
@@ -461,9 +462,10 @@ impl Client {
         });
         // Keep what loaded; one throttled message shouldn't blank the inbox.
         let (ok, errs): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| r.is_ok());
+        let complete = errs.is_empty();
         match (ok.is_empty(), errs.into_iter().next()) {
             (true, Some(Err(e))) => Err(e),
-            _ => Ok(ok.into_iter().map(Result::unwrap).collect()),
+            _ => Ok((ok.into_iter().map(Result::unwrap).collect(), complete)),
         }
     }
 

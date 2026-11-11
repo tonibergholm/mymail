@@ -230,11 +230,12 @@ impl MailApp {
                 if last.is_some() && h == last {
                     return Ok(None);
                 }
-                let list = client.list(&q)?;
-                if inbox {
+                let (list, complete) = client.list(&q)?;
+                if inbox && complete {
                     gmail::save_inbox(&client.email, &list);
                 }
-                Ok(Some((h, list)))
+                // A partial load must not count as in sync, or polls would skip the retry.
+                Ok(Some((h.filter(|_| complete), list)))
             },
             move |this, r, window, cx| {
                 let Ok(Some((h, list))) = r else { return };
@@ -300,20 +301,33 @@ impl MailApp {
             "Opening…",
             window,
             cx,
-            move || {
-                let m = client.message(&s.id)?;
-                let marked = !s.unread || client.modify(&s.id, &["UNREAD"]).is_ok();
-                Ok((m, marked))
+            {
+                let client = client.clone();
+                let id = s.id.clone();
+                move || client.message(&id)
             },
             move |this, r, window, cx| {
-                let Ok((m, marked)) = r else { return };
+                let Ok(m) = r else { return };
                 if this.selected.and_then(|i| this.list.get(i)).map(|x| &x.id) != Some(&m.id) {
                     return; // user moved on
                 }
-                if !marked {
-                    this.status = "Couldn't mark as read.".into();
-                } else if let Some(x) = this.list.iter_mut().find(|x| x.id == m.id) {
-                    x.unread = false;
+                if s.unread {
+                    // Separate request, so a cached message shows without waiting for the network.
+                    let id = s.id.clone();
+                    this.run(
+                        "",
+                        window,
+                        cx,
+                        move || client.modify(&id, &["UNREAD"]),
+                        move |this, r, _, _| match r {
+                            Ok(()) => {
+                                if let Some(x) = this.list.iter_mut().find(|x| x.id == s.id) {
+                                    x.unread = false;
+                                }
+                            }
+                            Err(_) => this.status = "Couldn't mark as read.".into(),
+                        },
+                    );
                 }
                 match &m.html {
                     #[cfg(target_os = "macos")]
