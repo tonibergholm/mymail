@@ -393,10 +393,14 @@ impl Client {
 
     pub fn message(&self, id: &str) -> Result<Message> {
         let mut m = self.get(&format!("/messages/{id}?format=full"))?;
-        inline_text_bodies(&mut m["payload"], &mut |att| {
-            Ok(self.get(&format!("/messages/{id}/attachments/{att}"))?["data"].clone())
-        })?;
-        Ok(parse_message(&m))
+        let mut fetch =
+            |att: &str| Ok(self.get(&format!("/messages/{id}/attachments/{att}"))?["data"].clone());
+        inline_text_bodies(&mut m["payload"], &mut fetch)?;
+        let mut msg = parse_message(&m);
+        if let Some(h) = &msg.html {
+            msg.html = Some(resolve_cids(&m["payload"], h, &mut fetch)?);
+        }
+        Ok(msg)
     }
 
     pub fn modify(&self, id: &str, remove: &[&str]) -> Result<()> {
@@ -661,6 +665,43 @@ fn html_to_text(html: &str) -> String {
         out += "\n";
     }
     out.trim().to_string()
+}
+
+/// Embedded images (`<img src="cid:...">`) live in sibling parts; inline the referenced ones
+/// as data: URIs so both readers can show them without network access.
+fn resolve_cids(
+    part: &Value,
+    html: &str,
+    fetch: &mut impl FnMut(&str) -> Result<Value>,
+) -> Result<String> {
+    let mut html = html.to_string();
+    let mime = part["mimeType"].as_str().unwrap_or("");
+    let cid = header(part, "Content-ID");
+    let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
+    let reference = format!("cid:{cid}");
+    if mime.starts_with("image/") && !cid.is_empty() && html.contains(&reference) {
+        let data = match part["body"]["data"].as_str() {
+            Some(d) => d.to_string(),
+            None => match part["body"]["attachmentId"].as_str() {
+                Some(att) => fetch(att)?.as_str().unwrap_or("").to_string(),
+                None => String::new(),
+            },
+        };
+        // Gmail sends base64url; data: URIs need standard base64.
+        let b64: String = data
+            .chars()
+            .map(|c| match c {
+                '-' => '+',
+                '_' => '/',
+                c => c,
+            })
+            .collect();
+        html = html.replace(&reference, &format!("data:{mime};base64,{b64}"));
+    }
+    for p in part["parts"].as_array().into_iter().flatten() {
+        html = resolve_cids(p, &html, fetch)?;
+    }
+    Ok(html)
 }
 
 fn find_bodies(part: &Value, plain: &mut Option<String>, html: &mut Option<String>) {
@@ -929,6 +970,23 @@ mod tests {
             strip_padding("Deal \u{34f}\u{2800}\u{200c} \u{34f}\u{2800}\u{200c}").trim_end(),
             "Deal"
         );
+    }
+
+    #[test]
+    fn resolves_embedded_cid_images() {
+        let payload = json!({"mimeType":"multipart/related","parts":[
+            {"mimeType":"text/html","body":{"data":""}},
+            {"mimeType":"image/png","filename":"a.png","headers":[{"name":"Content-ID","value":"<logo@x>"}],
+             "body":{"attachmentId":"A9"}},
+            {"mimeType":"image/gif","headers":[{"name":"Content-Id","value":"<unused@x>"}],"body":{"attachmentId":"NO"}}]});
+        let mut asked = vec![];
+        let out = resolve_cids(&payload, r#"<img src="cid:logo@x">"#, &mut |att| {
+            asked.push(att.to_string());
+            Ok(json!("ab-_"))
+        })
+        .unwrap();
+        assert_eq!(out, r#"<img src="data:image/png;base64,ab+/">"#);
+        assert_eq!(asked, ["A9"], "unreferenced images are not fetched");
     }
 
     #[test]
