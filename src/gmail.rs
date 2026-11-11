@@ -371,9 +371,11 @@ impl Client {
     }
 
     pub fn message(&self, id: &str) -> Result<Message> {
-        Ok(parse_message(
-            &self.get(&format!("/messages/{id}?format=full"))?,
-        ))
+        let mut m = self.get(&format!("/messages/{id}?format=full"))?;
+        inline_text_bodies(&mut m["payload"], &mut |att| {
+            Ok(self.get(&format!("/messages/{id}/attachments/{att}"))?["data"].clone())
+        })?;
+        Ok(parse_message(&m))
     }
 
     pub fn modify(&self, id: &str, remove: &[&str]) -> Result<()> {
@@ -462,6 +464,26 @@ pub fn parse_message(m: &Value) -> Message {
         references: header(p, "References"),
         body: body.replace("\r\n", "\n"),
     }
+}
+
+/// Large text parts arrive as `body.attachmentId` instead of `body.data`; fetch them inline.
+fn inline_text_bodies(
+    part: &mut Value,
+    fetch: &mut impl FnMut(&str) -> Result<Value>,
+) -> Result<()> {
+    let is_text = matches!(part["mimeType"].as_str(), Some("text/plain" | "text/html"));
+    let no_name = part["filename"].as_str().is_none_or(str::is_empty);
+    if is_text
+        && no_name
+        && part["body"]["data"].is_null()
+        && let Some(att) = part["body"]["attachmentId"].as_str()
+    {
+        part["body"]["data"] = fetch(att)?;
+    }
+    for p in part["parts"].as_array_mut().into_iter().flatten() {
+        inline_text_bodies(p, fetch)?;
+    }
+    Ok(())
 }
 
 fn find_bodies(part: &Value, plain: &mut Option<String>, html: &mut Option<String>) {
@@ -631,6 +653,21 @@ mod tests {
         assert_eq!(msg.message_id, "<m@x>");
         let m = json!({"payload":{"mimeType":"text/html","body":{"data":URL_SAFE.encode("<p>only <b>html</b></p>")}}});
         assert!(parse_message(&m).body.contains("only"));
+    }
+
+    #[test]
+    fn fetches_text_bodies_stored_as_attachments() {
+        let mut m = json!({"id":"1","payload":{"mimeType":"multipart/mixed","parts":[
+            {"mimeType":"text/plain","filename":"","body":{"attachmentId":"A1","size":90000}},
+            {"mimeType":"application/pdf","filename":"x.pdf","body":{"attachmentId":"A2"}}]}});
+        let mut asked = vec![];
+        inline_text_bodies(&mut m["payload"], &mut |att| {
+            asked.push(att.to_string());
+            Ok(json!(URL_SAFE.encode("big body")))
+        })
+        .unwrap();
+        assert_eq!(asked, ["A1"]);
+        assert_eq!(parse_message(&m).body, "big body");
     }
 
     #[test]

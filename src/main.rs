@@ -19,6 +19,7 @@ struct Compose {
     msg: Arc<Message>,
     to: Entity<InputState>,
     body: Entity<TextareaState>,
+    sending: bool,
 }
 
 struct MailApp {
@@ -106,7 +107,7 @@ impl MailApp {
         window: &mut Window,
         cx: &mut Context<Self>,
         job: impl FnOnce() -> gmail::Result<T> + Send + 'static,
-        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        done: impl FnOnce(&mut Self, gmail::Result<T>, &mut Window, &mut Context<Self>) + 'static,
     ) {
         self.status = label.to_string().into();
         cx.notify();
@@ -114,13 +115,11 @@ impl MailApp {
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(v) => {
-                        this.status = SharedString::default();
-                        done(this, v, window, cx);
-                    }
-                    Err(e) => this.status = e.into(),
-                }
+                this.status = match &result {
+                    Ok(_) => SharedString::default(),
+                    Err(e) => e.clone().into(),
+                };
+                done(this, result, window, cx);
                 cx.notify();
             })
             .ok();
@@ -143,6 +142,7 @@ impl MailApp {
             cx,
             move || client.list(&q),
             move |this, list, window, cx| {
+                let Ok(list) = list else { return };
                 // Drop stale results if the user switched account or query meanwhile.
                 let now = this.search.read(cx).value().trim().to_string();
                 if this.current != account
@@ -174,22 +174,24 @@ impl MailApp {
         };
         let s = self.list[ix].clone();
         self.compose = None;
+        self.open = None; // actions must not target the previous message while this one loads
         self.run(
             "Opening…",
             window,
             cx,
             move || {
                 let m = client.message(&s.id)?;
-                if s.unread {
-                    let _ = client.modify(&s.id, &["UNREAD"]);
-                }
-                Ok(m)
+                let marked = !s.unread || client.modify(&s.id, &["UNREAD"]).is_ok();
+                Ok((m, marked))
             },
-            move |this, m, window, cx| {
+            move |this, r, window, cx| {
+                let Ok((m, marked)) = r else { return };
                 if this.selected.and_then(|i| this.list.get(i)).map(|x| &x.id) != Some(&m.id) {
                     return; // user moved on
                 }
-                if let Some(x) = this.list.iter_mut().find(|x| x.id == m.id) {
+                if !marked {
+                    this.status = "Couldn't mark as read.".into();
+                } else if let Some(x) = this.list.iter_mut().find(|x| x.id == m.id) {
                     x.unread = false;
                 }
                 this.reader
@@ -210,7 +212,8 @@ impl MailApp {
         let (Some(ix), Some(client)) = (self.selected, self.client()) else {
             return;
         };
-        let id = self.list.remove(ix).id;
+        let (summary, account) = (self.list.remove(ix), self.current);
+        let id = summary.id.clone();
         self.open = None;
         self.compose = None;
         self.selected = None;
@@ -222,7 +225,17 @@ impl MailApp {
             window,
             cx,
             move || client.archive(&id),
-            |_, _, _, _| {},
+            move |this, r, _, _| {
+                // Optimistic removal: put the row back if Gmail refused.
+                if r.is_err()
+                    && this.current == account
+                    && !this.list.iter().any(|x| x.id == summary.id)
+                {
+                    let at = ix.min(this.list.len());
+                    this.list.insert(at, summary);
+                    this.selected = this.selected.map(|s| if s >= at { s + 1 } else { s });
+                }
+            },
         );
     }
 
@@ -248,14 +261,19 @@ impl MailApp {
             msg,
             to,
             body,
+            sending: false,
         });
         cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(c), Some(client)) = (self.compose.as_ref(), self.client()) else {
+        let client = self.client();
+        let (Some(c), Some(client)) = (self.compose.as_mut(), client) else {
             return;
         };
+        if c.sending {
+            return;
+        }
         let to = c.to.read(cx).value().trim().to_string();
         if !to.contains('@') {
             self.status = "Recipient missing.".into();
@@ -263,6 +281,8 @@ impl MailApp {
         }
         let text = c.body.read(cx).value().to_string();
         let (kind, msg) = (c.kind, c.msg.clone());
+        c.sending = true;
+        let draft = c.body.entity_id();
         self.run(
             "Sending…",
             window,
@@ -276,7 +296,19 @@ impl MailApp {
                     client.send(&gmail::forward_raw(&client.email, &to, &msg, &text), None)
                 }
             },
-            |this, _, window, cx| {
+            move |this, r, window, cx| {
+                // Only touch the composer that sent; another may have opened meanwhile.
+                let Some(c) = this
+                    .compose
+                    .as_mut()
+                    .filter(|c| c.body.entity_id() == draft)
+                else {
+                    return;
+                };
+                if r.is_err() {
+                    c.sending = false;
+                    return;
+                }
                 this.compose = None;
                 this.status = "Sent.".into();
                 this.focus.focus(window, cx);
@@ -303,6 +335,7 @@ impl MailApp {
             cx,
             move || login.finish(&o),
             move |this, acct, window, cx| {
+                let Ok(acct) = acct else { return };
                 this.saved.retain(|a| a.email != acct.email);
                 this.clients.retain(|c| c.email != acct.email);
                 this.saved.push(acct.clone());
@@ -310,10 +343,20 @@ impl MailApp {
                 if let Err(e) = gmail::save_accounts(&this.saved) {
                     this.status = format!("Signed in, but saving failed: {e}").into();
                 }
-                this.current = this.clients.len() - 1;
-                this.refresh(window, cx);
+                let last = this.clients.len() - 1;
+                this.switch_account(last, window, cx);
             },
         );
+    }
+
+    /// Clear everything bound to the old account before loading the new one.
+    fn switch_account(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.current = i;
+        self.list.clear();
+        self.selected = None;
+        self.open = None;
+        self.compose = None;
+        self.refresh(window, cx);
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -457,6 +500,7 @@ impl MailApp {
                                 Button::new("send")
                                     .primary()
                                     .small()
+                                    .loading(c.sending)
                                     .label("Send")
                                     .on_click(cx.listener(|this, _, w, cx| this.send(w, cx))),
                             )
@@ -505,8 +549,7 @@ impl Render for MailApp {
             };
             accounts = accounts.child(b.on_click(cx.listener(move |this, _, w, cx| {
                 if this.current != i {
-                    this.current = i;
-                    this.refresh(w, cx);
+                    this.switch_account(i, w, cx);
                 }
             })));
         }
