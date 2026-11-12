@@ -4344,7 +4344,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mymail"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -4354,6 +4354,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre-reqwest-client",
  "html2text",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.1",

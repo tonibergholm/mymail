@@ -66,6 +66,13 @@ Optional `settings.json` in the same directory:
 
 `poll_secs` is how often the inbox checks for new mail; `0` turns it off.
 
+```json
+{ "poll_secs": 60, "auto_update": true }
+```
+
+`auto_update` (default `true`) lets MyMail install new releases by itself. Set it
+to `false` to turn that off; changes apply the next time the app starts.
+
 Cached mail lives in `~/Library/Caches/mymail` (macOS) or `~/.cache/mymail`
 (Linux), readable only by you. Entries older than 30 days are removed at
 startup. Delete the folder to clear it.
@@ -81,6 +88,32 @@ installs `~/.local/bin/mymail`, an icon, and a desktop entry, so MyMail shows up
 in your launcher (Walker on Omarchy).
 
 To run without installing: `cargo run --release`.
+
+## Updates and releases
+
+The window title shows the running version (`MyMail v0.2.0`), and so does
+`mymail --version`.
+
+An installed build (`/Applications/MyMail.app` on macOS, `~/.local/bin/mymail`
+on Linux) checks GitHub Releases shortly after it starts and every six hours.
+When a newer release exists, it downloads it, checks the SHA-256 digest GitHub
+publishes for the file, and replaces itself. Then it restarts into the new
+version, or waits until you close an open draft. Builds run with `cargo run` or
+from `target/` never update themselves. The macOS release is Apple Silicon only,
+and the Linux one is x86_64.
+
+Releases are not notarized (the app is ad-hoc signed). The first install from a
+browser download may need right-click, Open, and a one-time approval in System
+Settings. Updates the app installs itself don't go through that prompt.
+
+To publish a release: bump `version` in `Cargo.toml` (and `Cargo.lock`), merge,
+then push a matching tag.
+
+```sh
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+The Release workflow builds both platforms and creates the GitHub release.
 
 Linux needs the usual GPUI build dependencies (Vulkan, Wayland or X11,
 xkbcommon, fontconfig). See the

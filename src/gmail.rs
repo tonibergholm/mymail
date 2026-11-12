@@ -53,7 +53,7 @@ pub struct SavedAccount {
     pub refresh_token: String,
 }
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| ".".into())
         .join("mymail")
@@ -102,13 +102,20 @@ pub fn save_accounts(accounts: &[SavedAccount]) -> Result<()> {
     )
 }
 
-/// `settings.json` in the config dir: `{"poll_secs": 60}`; 0 turns checking off.
-pub fn poll_secs() -> u64 {
+fn setting(key: &str) -> Value {
     std::fs::read(dir().join("settings.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v["poll_secs"].as_u64())
-        .unwrap_or(60)
+        .map_or(Value::Null, |v| v[key].clone())
+}
+
+/// `settings.json` in the config dir: `{"poll_secs": 60, "auto_update": true}`; 0 turns checking off.
+pub fn poll_secs() -> u64 {
+    setting("poll_secs").as_u64().unwrap_or(60)
+}
+
+pub fn auto_update() -> bool {
+    setting("auto_update").as_bool().unwrap_or(true)
 }
 
 /// Owner-only file (and 0700 parent dirs): tokens and cached mail.

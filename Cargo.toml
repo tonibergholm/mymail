@@ -1,7 +1,11 @@
 [package]
 name = "mymail"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+
+[features]
+# Lets tests point the updater at a local server and a non-/Applications bundle. Never in releases.
+update-test = []
 
 [dependencies]
 base64 = "0.23.1"
@@ -18,4 +22,5 @@ sha2 = "0.11.1"
 ureq = { version = "3", features = ["json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 wry = "0.57"
