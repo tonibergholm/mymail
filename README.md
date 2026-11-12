@@ -102,6 +102,11 @@ version, or waits until you close an open draft. Builds run with `cargo run` or
 from `target/` never update themselves. The macOS release is Apple Silicon only,
 and the Linux one is x86_64.
 
+The download is checked against the SHA-256 digest GitHub publishes for it. That
+catches a corrupt download, not a bad release: anyone who can push a release tag
+to this repository can ship code to every install. The previous version stays in
+a hidden `.mymail-update-*` folder next to the app for a day.
+
 Releases are not notarized (the app is ad-hoc signed). The first install from a
 browser download may need right-click, Open, and a one-time approval in System
 Settings. Updates the app installs itself don't go through that prompt.

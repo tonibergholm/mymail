@@ -61,19 +61,23 @@ fn parse_version(s: &str) -> Option<Ver> {
     it.next().is_none().then_some(v)
 }
 
-fn recorded() -> Option<Ver> {
+/// The version of the build installed at `target`, which may be newer than the running one
+/// (installed, waiting for a restart). Asking the binary beats a state file that can go stale.
+fn installed(target: &Path) -> Option<Ver> {
+    let out = Command::new(exe_in(target))
+        .arg("--version")
+        .output()
+        .ok()?;
     parse_version(
-        std::fs::read_to_string(gmail::dir().join("installed_version"))
-            .ok()?
-            .trim(),
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .strip_prefix("mymail ")?,
     )
 }
 
-/// The newest version already on disk: running, or installed but waiting for a restart.
-fn newest_known() -> Ver {
-    parse_version(VERSION)
-        .unwrap_or_default()
-        .max(recorded().unwrap_or_default())
+fn newest_known(target: &Path) -> Ver {
+    let running = parse_version(VERSION).unwrap_or_default();
+    running.max(installed(target).unwrap_or_default())
 }
 
 // ---------- release lookup ----------
@@ -120,7 +124,7 @@ fn api_url() -> String {
     format!("https://api.github.com/repos/{REPO}/releases/latest")
 }
 
-fn latest() -> Result<Option<Candidate>> {
+fn latest(target: &Path) -> Result<Option<Candidate>> {
     let Some(asset) = ASSET else { return Ok(None) };
     let release: Value = agent()
         .get(api_url())
@@ -130,31 +134,43 @@ fn latest() -> Result<Option<Candidate>> {
         .body_mut()
         .read_json()
         .map_err(err)?;
-    Ok(candidate(&release, asset)?.filter(|c| c.ver > newest_known()))
+    Ok(candidate(&release, asset)?.filter(|c| c.ver > newest_known(target)))
 }
 
 // ---------- where we may install ----------
 
 /// macOS: the `.app` bundle. Linux: the executable. `None` for any other (development) build.
-#[cfg(target_os = "macos")]
+/// Fixed at first use (`init`, at startup): once an update replaces the file, Linux reports the
+/// running executable as "... (deleted)", so the path can't be worked out again later.
 fn target() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    static T: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let home = dirs::home_dir()?.canonicalize().ok()?;
+        installed_path(std::env::current_exe().ok()?, home)
+    })
+    .clone()
+}
+
+pub fn init() {
+    let _ = target();
+}
+
+#[cfg(target_os = "macos")]
+fn installed_path(exe: PathBuf, home: PathBuf) -> Option<PathBuf> {
     if !exe.ends_with("MyMail.app/Contents/MacOS/mymail") {
         return None;
     }
     let bundle = exe.parent()?.parent()?.parent()?.to_path_buf();
-    let homes = [
-        PathBuf::from("/Applications"),
-        dirs::home_dir()?.join("Applications"),
-    ];
-    let ok = cfg!(feature = "update-test") || homes.iter().any(|d| bundle.parent() == Some(d));
+    let dir = bundle.parent()?;
+    let ok = cfg!(feature = "update-test")
+        || dir == Path::new("/Applications")
+        || dir == home.join("Applications");
     ok.then_some(bundle)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn target() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    (exe == dirs::home_dir()?.join(".local/bin/mymail")).then_some(exe)
+fn installed_path(exe: PathBuf, home: PathBuf) -> Option<PathBuf> {
+    (exe == home.join(".local/bin/mymail")).then_some(exe)
 }
 
 /// Exclusive across instances, so two copies of the app never swap at once.
@@ -216,7 +232,7 @@ fn unpack(archive: &Path, stage: &Path) -> Result<PathBuf> {
         return Err("unexpected archive layout".into());
     }
     let app = out.join("MyMail.app");
-    if !is_regular_file(&staged_exe(&app)) {
+    if !is_regular_file(&exe_in(&app)) {
         return Err("archive has no executable".into());
     }
     run_ok(
@@ -250,7 +266,7 @@ fn unpack(archive: &Path, stage: &Path) -> Result<PathBuf> {
     Ok(exe)
 }
 
-fn staged_exe(new: &Path) -> PathBuf {
+fn exe_in(new: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         new.join("Contents/MacOS/mymail")
     } else {
@@ -299,7 +315,7 @@ fn stage_and_swap(target: &Path, stage: &Path, c: &Candidate) -> Result<()> {
     std::fs::write(&archive, bytes).map_err(err)?;
     let new = unpack(&archive, stage)?;
     // Also proves the right architecture and version before it replaces anything.
-    let out = run_ok(Command::new(staged_exe(&new)).arg("--version"))?;
+    let out = run_ok(Command::new(exe_in(&new)).arg("--version"))?;
     if String::from_utf8_lossy(&out.stdout).trim() != format!("mymail {}", c.version) {
         return Err("downloaded build reports a different version".into());
     }
@@ -329,7 +345,7 @@ pub fn run() -> Result<Option<String>> {
     let Some(target) = target() else {
         return Ok(None);
     };
-    let c = match latest() {
+    let c = match latest(&target) {
         Ok(Some(c)) => c,
         Ok(None) => return Ok(None),
         Err(e) => {
@@ -340,11 +356,10 @@ pub fn run() -> Result<Option<String>> {
     let Some(_lock) = lock()? else {
         return Ok(None);
     };
-    if c.ver <= newest_known() {
+    if c.ver <= newest_known(&target) {
         return Ok(None); // another instance installed it while we downloaded
     }
     install(&target, &c)?;
-    std::fs::write(gmail::dir().join("installed_version"), &c.version).map_err(err)?;
     Ok(Some(c.version))
 }
 
@@ -453,6 +468,41 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", not(feature = "update-test")))]
+    fn only_the_canonical_bundle_updates() {
+        let home = PathBuf::from("/Users/me");
+        let exe = |d: &str| PathBuf::from(format!("{d}/MyMail.app/Contents/MacOS/mymail"));
+        let got = |d: &str| installed_path(exe(d), home.clone());
+        assert_eq!(
+            got("/Applications"),
+            Some("/Applications/MyMail.app".into())
+        );
+        assert_eq!(
+            got("/Users/me/Applications"),
+            Some("/Users/me/Applications/MyMail.app".into())
+        );
+        assert_eq!(got("/repo/target/release"), None);
+        assert_eq!(
+            installed_path("/Applications/Other.app/Contents/MacOS/mymail".into(), home),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn only_the_installed_executable_updates() {
+        let home = PathBuf::from("/home/me");
+        let got = |p: &str| installed_path(p.into(), home.clone());
+        assert_eq!(
+            got("/home/me/.local/bin/mymail"),
+            Some("/home/me/.local/bin/mymail".into())
+        );
+        // What Linux reports for the running exe after an update replaced it.
+        assert_eq!(got("/home/me/.local/bin/mymail (deleted)"), None);
+        assert_eq!(got("/repo/target/release/mymail"), None);
     }
 
     #[test]

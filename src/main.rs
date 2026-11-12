@@ -182,6 +182,7 @@ impl MailApp {
         if !gmail::auto_update() {
             return;
         }
+        update::init();
         cx.spawn_in(window, async move |this, cx| {
             let exec = cx.background_executor().clone();
             let wait = |secs| exec.timer(std::time::Duration::from_secs(secs));
