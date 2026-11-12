@@ -1,4 +1,5 @@
 mod gmail;
+mod update;
 #[cfg(target_os = "macos")]
 mod web;
 
@@ -172,7 +173,68 @@ impl MailApp {
             })
             .detach();
         }
+        app.start_updates(window, cx);
         app
+    }
+
+    /// Install newer releases in the background and restart into them once no draft is open.
+    fn start_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !gmail::auto_update() {
+            return;
+        }
+        update::init();
+        cx.spawn_in(window, async move |this, cx| {
+            let exec = cx.background_executor().clone();
+            let wait = |secs| exec.timer(std::time::Duration::from_secs(secs));
+            wait(10).await;
+            exec.spawn(async { update::cleanup() }).await;
+            let (mut installed, mut told) = (None::<String>, false);
+            for tick in 0u32.. {
+                if installed.is_none() && tick % 360 == 0 {
+                    // Every 6 hours. Failures show once; the next round tries again.
+                    match exec.spawn(async { update::run() }).await {
+                        Ok(v) => installed = v,
+                        Err(e) => {
+                            let _ = this.update(cx, |this, cx| {
+                                this.status = format!("Update failed: {e}").into();
+                                cx.notify();
+                            });
+                        }
+                    }
+                }
+                if let Some(v) = &installed {
+                    let done = this.update_in(cx, |this, _, cx| {
+                        let mut say = |this: &mut Self, msg: String| {
+                            this.status = msg.into();
+                            cx.notify();
+                        };
+                        if this.compose.is_some() {
+                            if !told {
+                                say(
+                                    this,
+                                    format!("Updated to v{v}. Close the draft to restart."),
+                                );
+                                told = true;
+                            }
+                            return false;
+                        }
+                        match update::relaunch() {
+                            Ok(()) => cx.quit(),
+                            Err(e) => say(
+                                this,
+                                format!("Updated to v{v}. Restart MyMail to use it ({e})."),
+                            ),
+                        }
+                        true
+                    });
+                    if done.unwrap_or(true) {
+                        break;
+                    }
+                }
+                wait(60).await;
+            }
+        })
+        .detach();
     }
 
     /// Typed text in an open composer that navigating away would throw away.
@@ -1237,6 +1299,11 @@ impl Render for MailApp {
 }
 
 fn main() {
+    // Also how the updater checks a downloaded build before installing it.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("mymail {}", update::VERSION);
+        return;
+    }
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
@@ -1250,7 +1317,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     app_id: Some("mymail".into()), // matches the Linux .desktop entry
                     titlebar: Some(TitlebarOptions {
-                        title: Some("MyMail".into()),
+                        title: Some(format!("MyMail v{}", update::VERSION).into()),
                         ..Default::default()
                     }),
                     ..Default::default()
