@@ -516,24 +516,25 @@ mod tests {
     #[test]
     fn swap_replaces_the_target_and_keeps_the_old_one() {
         let d = tmp("swap");
-        let (old, new) = (d.join("MyMail.app"), d.join("new"));
-        std::fs::create_dir(&old).unwrap();
-        std::fs::write(old.join("v"), "old").unwrap();
         #[cfg(target_os = "macos")]
         {
-            std::fs::create_dir(&new).unwrap();
-            std::fs::write(new.join("v"), "new").unwrap();
-            swap(&new, &old).unwrap();
-            assert_eq!(std::fs::read_to_string(old.join("v")).unwrap(), "new");
+            // Directory exchange: the old bundle ends up at the staged path.
+            let (target, new) = (d.join("MyMail.app"), d.join("new"));
+            for (dir, v) in [(&target, "old"), (&new, "new")] {
+                std::fs::create_dir(dir).unwrap();
+                std::fs::write(dir.join("v"), v).unwrap();
+            }
+            swap(&new, &target).unwrap();
+            assert_eq!(std::fs::read_to_string(target.join("v")).unwrap(), "new");
             assert_eq!(std::fs::read_to_string(new.join("v")).unwrap(), "old");
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let (old, new) = (d.join("mymail"), d.join("mymail.new"));
-            std::fs::write(&old, "old").unwrap();
+            let (target, new) = (d.join("mymail"), d.join("mymail.new"));
+            std::fs::write(&target, "old").unwrap();
             std::fs::write(&new, "new").unwrap();
-            swap(&new, &old).unwrap();
-            assert_eq!(std::fs::read_to_string(&old).unwrap(), "new");
+            swap(&new, &target).unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
         }
     }
 }
