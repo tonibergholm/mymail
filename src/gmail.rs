@@ -554,6 +554,18 @@ pub fn guess_mime(name: &str) -> &'static str {
     }
 }
 
+/// Calls `call` with a cached token; a 401 means Google dropped it, so retry once with a fresh one.
+fn retry_401<T>(
+    mut token: impl FnMut(bool) -> Result<String>,
+    call: impl Fn(&str) -> std::result::Result<T, ureq::Error>,
+) -> Result<T> {
+    match call(&token(false)?) {
+        Err(ureq::Error::StatusCode(401)) => call(&token(true)?),
+        r => r,
+    }
+    .map_err(err)
+}
+
 pub struct Client {
     pub email: String,
     oauth: OAuthClient,
@@ -571,9 +583,14 @@ impl Client {
         }
     }
 
-    fn token(&self) -> Result<String> {
+    /// `fresh` skips the cache. `Instant` stops during sleep on macOS, so a cached token
+    /// can look valid long after Google expired it.
+    fn token(&self, fresh: bool) -> Result<String> {
         let mut guard = self.token.lock().unwrap();
-        if let Some((t, _)) = guard.as_ref().filter(|(_, exp)| *exp > Instant::now()) {
+        if let Some((t, _)) = guard
+            .as_ref()
+            .filter(|(_, exp)| !fresh && *exp > Instant::now())
+        {
             return Ok(t.clone());
         }
         let resp: Value = http()
@@ -607,28 +624,35 @@ impl Client {
         Ok(t)
     }
 
+    /// Runs `call` with a bearer token; on a 401 it retries once with a freshly fetched one.
+    fn authed<T>(&self, call: impl Fn(&str) -> std::result::Result<T, ureq::Error>) -> Result<T> {
+        retry_401(|fresh| self.token(fresh), call)
+    }
+
     fn get(&self, path: &str) -> Result<Value> {
-        http()
-            .get(format!("{API}{path}"))
-            .header("Authorization", format!("Bearer {}", self.token()?))
-            .call()
-            .map_err(err)?
-            .body_mut()
-            .with_config()
-            .limit(64 << 20) // a 25 MB attachment is ~34 MB as base64 JSON
-            .read_json()
-            .map_err(err)
+        self.authed(|t| {
+            http()
+                .get(format!("{API}{path}"))
+                .header("Authorization", format!("Bearer {t}"))
+                .call()
+        })?
+        .body_mut()
+        .with_config()
+        .limit(64 << 20) // a 25 MB attachment is ~34 MB as base64 JSON
+        .read_json()
+        .map_err(err)
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value> {
-        http()
-            .post(format!("{API}{path}"))
-            .header("Authorization", format!("Bearer {}", self.token()?))
-            .send_json(body)
-            .map_err(err)?
-            .body_mut()
-            .read_json()
-            .map_err(err)
+        self.authed(|t| {
+            http()
+                .post(format!("{API}{path}"))
+                .header("Authorization", format!("Bearer {t}"))
+                .send_json(&body)
+        })?
+        .body_mut()
+        .read_json()
+        .map_err(err)
     }
 
     /// Gmail search syntax, newest first. Metadata is fetched in parallel.
@@ -738,13 +762,14 @@ impl Client {
             "--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n\
              --{b}\r\nContent-Type: message/rfc822\r\n\r\n{raw}\r\n--{b}--\r\n"
         );
-        http()
-            .post("https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=multipart")
-            .header("Authorization", format!("Bearer {}", self.token()?))
-            .header("Content-Type", format!("multipart/related; boundary={b}"))
-            .send(body.as_bytes())
-            .map_err(err)
-            .map(|_| ())
+        self.authed(|t| {
+            http()
+                .post("https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=multipart")
+                .header("Authorization", format!("Bearer {t}"))
+                .header("Content-Type", format!("multipart/related; boundary={b}"))
+                .send(body.as_bytes())
+        })
+        .map(|_| ())
     }
 
     /// Download one attachment. Looks the part up again by its stable part id, because
@@ -1274,6 +1299,48 @@ pub fn forward_raw(me: &str, to: &str, msg: &Message, text: &str, files: &[File]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_once_with_a_fresh_token_on_401() {
+        let calls = std::cell::RefCell::new(vec![]);
+        let r = retry_401(
+            |fresh| Ok(if fresh { "new" } else { "old" }.to_string()),
+            |t| {
+                calls.borrow_mut().push(t.to_string());
+                if t == "old" {
+                    Err(ureq::Error::StatusCode(401))
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(r, Ok(7));
+        assert_eq!(*calls.borrow(), ["old", "new"]);
+    }
+
+    #[test]
+    fn gives_up_after_one_retry_and_ignores_other_errors() {
+        let n = std::cell::Cell::new(0);
+        let r: Result<()> = retry_401(
+            |_| Ok(String::new()),
+            |_| {
+                n.set(n.get() + 1);
+                Err(ureq::Error::StatusCode(401))
+            },
+        );
+        assert_eq!(r, Err("http status: 401".into()));
+        assert_eq!(n.get(), 2);
+        n.set(0);
+        let r: Result<()> = retry_401(
+            |_| Ok(String::new()),
+            |_| {
+                n.set(n.get() + 1);
+                Err(ureq::Error::StatusCode(500))
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!(n.get(), 1);
+    }
 
     fn decode_body(raw: &str) -> String {
         let b64: String = raw
