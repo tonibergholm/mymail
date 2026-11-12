@@ -1,4 +1,5 @@
 mod gmail;
+mod shortcuts;
 mod update;
 #[cfg(target_os = "macos")]
 mod web;
@@ -1226,6 +1227,15 @@ impl Render for MailApp {
             .bg(t.background)
             .text_color(t.foreground)
             .text_sm()
+            .on_action(cx.listener(|_, _: &shortcuts::Minimize, w, _| w.minimize_window()))
+            .on_action(cx.listener(|_, _: &shortcuts::Zoom, w, _| w.zoom_window()))
+            .on_action(cx.listener(|_, _: &shortcuts::CloseWindow, w, _| w.remove_window()))
+            .on_action(cx.listener(|this, _: &shortcuts::NewMessage, w, cx| {
+                this.start_compose(Kind::New, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &shortcuts::FocusSearch, w, cx| {
+                this.search.update(cx, |s, cx| s.focus(w, cx))
+            }))
             .child(
                 h_flex()
                     .gap_2()
@@ -1308,6 +1318,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            shortcuts::install(cx);
             // Lets HTML mail load remote images.
             cx.set_http_client(Arc::new(reqwest_client::ReqwestClient::new()));
             cx.on_window_closed(|cx, _| cx.quit()).detach();
